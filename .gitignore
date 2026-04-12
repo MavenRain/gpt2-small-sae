@@ -1,0 +1,9 @@
+/target
+/checkpoints
+/activations
+/dashboards
+Cargo.lock.bak
+.DS_Store
+*.safetensors
+!configs/*.safetensors
+.env

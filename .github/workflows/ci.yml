@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+      - run: cargo check --no-default-features --features cpu
+      - run: cargo clippy --no-default-features --features cpu -- -D warnings
+      - run: cargo fmt --check
+      - run: cargo test --no-default-features --features cpu

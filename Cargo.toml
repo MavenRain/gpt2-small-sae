@@ -1,0 +1,76 @@
+[package]
+name = "gpt2-small-sae"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Sparse autoencoders on GPT-2 small residual stream, Rust/candle on Metal."
+repository = "https://github.com/oobi/gpt2-small-sae"
+readme = "README.md"
+categories = ["science", "mathematics"]
+keywords = ["sae", "mechanistic-interpretability", "gpt2", "candle"]
+
+[lib]
+name = "gpt2_small_sae"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smoke"
+path = "src/bin/smoke.rs"
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
+
+[[bin]]
+name = "eval_pretrained"
+path = "src/bin/eval_pretrained.rs"
+
+[dependencies]
+comp-cat-rs = "0.5"
+
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+safetensors = "0.7"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series"] }
+pathfinding = "4"
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cpu = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+opt-level = 1
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+needless_pass_by_value = "warn"
+manual_map = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+unreachable = "deny"
+# Tensor accessors cannot be const; GPT-2 field prefixes are intentional.
+missing_const_for_fn = "allow"
+struct_field_names = "allow"
