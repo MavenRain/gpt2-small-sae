@@ -150,3 +150,88 @@ impl From<TokenizerError> for Error {
         Self::Tokenizer(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_config_error() {
+        let e = Error::Config {
+            reason: "bad value".into(),
+        };
+        assert_eq!(format!("{e}"), "configuration error: bad value");
+    }
+
+    #[test]
+    fn display_train_error() {
+        let e = Error::Train {
+            reason: "nan loss".into(),
+        };
+        assert_eq!(format!("{e}"), "training error: nan loss");
+    }
+
+    #[test]
+    fn display_boundary_error() {
+        let e = Error::Boundary {
+            reason: "missing file".into(),
+        };
+        assert_eq!(format!("{e}"), "boundary error: missing file");
+    }
+
+    #[test]
+    fn display_shape_error() {
+        let e = Error::Shape {
+            what: "w_enc",
+            expected: vec![768, 6144],
+            actual: vec![768, 1024],
+        };
+        let msg = format!("{e}");
+        assert!(msg.contains("w_enc"));
+        assert!(msg.contains("[768, 6144]"));
+        assert!(msg.contains("[768, 1024]"));
+    }
+
+    #[test]
+    fn display_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let e = Error::Io(io_err);
+        assert!(format!("{e}").starts_with("io error:"));
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "oops");
+        let e: Error = io_err.into();
+        assert!(matches!(e, Error::Io(_)));
+    }
+
+    #[test]
+    fn from_tokenizer_error() {
+        let te = TokenizerError::new("bad encoding");
+        let e: Error = te.into();
+        assert!(matches!(e, Error::Tokenizer(_)));
+        assert!(format!("{e}").contains("bad encoding"));
+    }
+
+    #[test]
+    fn tokenizer_error_display() {
+        let te = TokenizerError::new("failed to encode");
+        assert_eq!(format!("{te}"), "failed to encode");
+    }
+
+    #[test]
+    fn source_returns_none_for_domain_variants() {
+        let e = Error::Config {
+            reason: "test".into(),
+        };
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    #[test]
+    fn source_returns_some_for_io_variant() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "inner");
+        let e = Error::Io(io_err);
+        assert!(std::error::Error::source(&e).is_some());
+    }
+}

@@ -58,6 +58,8 @@ struct SweepOpts {
     num_batches: usize,
     corpus: Option<std::path::PathBuf>,
     prefix: String,
+    save_acts: bool,
+    load_acts: bool,
 }
 
 fn parse_sweep_opts() -> Result<SweepOpts, Error> {
@@ -102,6 +104,8 @@ fn parse_sweep_opts() -> Result<SweepOpts, Error> {
             .or_else(|| args.positional(0))
             .map(std::path::PathBuf::from),
         prefix: args.get_or("prefix", String::new())?,
+        save_acts: args.get_or("save-acts", false)?,
+        load_acts: args.get_or("load-acts", false)?,
     })
 }
 
@@ -109,92 +113,182 @@ fn parse_sweep_opts() -> Result<SweepOpts, Error> {
 // Main Io program
 // -----------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
 fn sweep_program() -> Io<Error, ()> {
     parse_sweep_opts().map_or_else(
         |e| Io::suspend(move || Err(e)),
         |opts| {
-            let needs_tokenizer = opts.corpus.is_some();
             io_boundary::acquire_device().flat_map(move |device| {
-                let opts = opts.clone();
-                io_boundary::download_gpt2_weights().flat_map(move |weights| {
-                    let opts = opts.clone();
-                    let tokenizer_io: Io<Error, Option<tokenizers::Tokenizer>> = if needs_tokenizer
-                    {
-                        io_boundary::download_tokenizer().map(Some)
-                    } else {
-                        Io::pure(None)
-                    };
-                    tokenizer_io.flat_map(move |maybe_tokenizer| {
-                        let opts2 = opts.clone();
-                        Io::suspend(move || {
-                            eprintln!("=== multi-layer SAE sweep ===");
-                            eprintln!(
-                                "layers: {:?}, expansion: {}x, steps: {}",
-                                opts.layers, opts.hyper.expansion, opts.hyper.num_steps,
-                            );
-                            eprintln!();
+                if opts.load_acts {
+                    sweep_cached(opts, device)
+                } else {
+                    sweep_fresh(opts, device)
+                }
+            })
+        },
+    )
+}
 
-                            let batches = opts.corpus.as_deref().map_or_else(
-                                || {
-                                    eprintln!(
-                                        "generating {} random token batches \
-                                         ({} x {})...",
-                                        opts.num_batches, opts.batch_size, opts.ctx_len,
-                                    );
-                                    (0..opts.num_batches)
-                                        .map(|_| {
-                                            Tensor::rand(
-                                                0.0f32,
-                                                VOCAB_UPPER,
-                                                (opts.batch_size, opts.ctx_len),
-                                                &device,
-                                            )
-                                            .and_then(|t| t.to_dtype(DType::U32))
-                                            .map_err(Error::from)
-                                        })
-                                        .collect::<Result<Vec<_>, _>>()
-                                },
-                                |path| {
-                                    eprintln!("tokenizing corpus: {}...", path.display());
-                                    let tokenizer = maybe_tokenizer.as_ref().ok_or_else(|| {
-                                        Error::Boundary {
-                                            reason: "tokenizer not loaded".into(),
-                                        }
-                                    })?;
-                                    let text = std::fs::read_to_string(path).map_err(|e| {
-                                        Error::Boundary {
-                                            reason: format!(
-                                                "failed to read corpus {}: {e}",
-                                                path.display()
-                                            ),
-                                        }
-                                    })?;
-                                    let bs = BatchSize::new(opts.batch_size)?;
-                                    let cl = ContextLength::new(opts.ctx_len)?;
-                                    let batches =
-                                        tokenize_corpus(&text, tokenizer, bs, cl, &device)?;
-                                    if batches.is_empty() {
-                                        Err(Error::Boundary {
-                                            reason: format!(
-                                                "corpus too short ({} tokens needed)",
-                                                opts.batch_size * opts.ctx_len
-                                            ),
-                                        })
-                                    } else {
-                                        Ok(batches)
-                                    }
-                                },
-                            )?;
+/// Download GPT-2, build token batches, collect activations fresh,
+/// and sweep all layers.
+#[allow(clippy::too_many_lines)]
+fn sweep_fresh(opts: SweepOpts, device: candle_core::Device) -> Io<Error, ()> {
+    let needs_tokenizer = opts.corpus.is_some();
+    io_boundary::download_gpt2_weights().flat_map(move |weights| {
+        let opts = opts.clone();
+        let tokenizer_io: Io<Error, Option<tokenizers::Tokenizer>> = if needs_tokenizer {
+            io_boundary::download_tokenizer().map(Some)
+        } else {
+            Io::pure(None)
+        };
+        tokenizer_io.flat_map(move |maybe_tokenizer| {
+            let opts2 = opts.clone();
+            Io::suspend(move || {
+                eprintln!("=== multi-layer SAE sweep ===");
+                eprintln!(
+                    "layers: {:?}, expansion: {}x, steps: {}",
+                    opts.layers, opts.hyper.expansion, opts.hyper.num_steps,
+                );
+                eprintln!();
 
-                            Ok((Arc::new(weights), batches, device))
-                        })
-                        .flat_map(move |(weights, batches, device)| {
-                            sweep_layers(opts2, weights, batches, device)
+                let batches = opts.corpus.as_deref().map_or_else(
+                    || {
+                        eprintln!(
+                            "generating {} random token batches \
+                             ({} x {})...",
+                            opts.num_batches, opts.batch_size, opts.ctx_len,
+                        );
+                        (0..opts.num_batches)
+                            .map(|_| {
+                                Tensor::rand(
+                                    0.0f32,
+                                    VOCAB_UPPER,
+                                    (opts.batch_size, opts.ctx_len),
+                                    &device,
+                                )
+                                .and_then(|t| t.to_dtype(DType::U32))
+                                .map_err(Error::from)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    },
+                    |path| {
+                        eprintln!("tokenizing corpus: {}...", path.display());
+                        let tokenizer =
+                            maybe_tokenizer.as_ref().ok_or_else(|| Error::Boundary {
+                                reason: "tokenizer not loaded".into(),
+                            })?;
+                        let text = std::fs::read_to_string(path).map_err(|e| Error::Boundary {
+                            reason: format!("failed to read corpus {}: {e}", path.display()),
+                        })?;
+                        let bs = BatchSize::new(opts.batch_size)?;
+                        let cl = ContextLength::new(opts.ctx_len)?;
+                        let batches = tokenize_corpus(&text, tokenizer, bs, cl, &device)?;
+                        if batches.is_empty() {
+                            Err(Error::Boundary {
+                                reason: format!(
+                                    "corpus too short ({} tokens needed)",
+                                    opts.batch_size * opts.ctx_len
+                                ),
+                            })
+                        } else {
+                            Ok(batches)
+                        }
+                    },
+                )?;
+
+                Ok((Arc::new(weights), batches, device))
+            })
+            .flat_map(move |(weights, batches, device)| {
+                sweep_layers(opts2, weights, batches, device)
+            })
+        })
+    })
+}
+
+/// Load pre-cached activations per layer and sweep without running
+/// GPT-2 at all.
+fn sweep_cached(opts: SweepOpts, device: candle_core::Device) -> Io<Error, ()> {
+    Io::suspend(move || {
+        eprintln!("=== multi-layer SAE sweep (cached activations) ===");
+        eprintln!(
+            "layers: {:?}, expansion: {}x, steps: {}",
+            opts.layers, opts.hyper.expansion, opts.hyper.num_steps,
+        );
+        eprintln!();
+        Ok((opts, device))
+    })
+    .flat_map(|(opts, device)| {
+        let SweepOpts {
+            layers,
+            hyper,
+            prefix,
+            ..
+        } = opts;
+        layers
+            .into_iter()
+            .fold(
+                Io::pure(Vec::<(usize, TrainMetrics)>::new()),
+                move |acc, layer| {
+                    let device = device.clone();
+                    let prefix = prefix.clone();
+                    acc.flat_map(move |results| {
+                        sweep_one_layer_cached(layer, device, hyper, prefix).map(move |metrics| {
+                            results
+                                .into_iter()
+                                .chain(std::iter::once((layer, metrics)))
+                                .collect()
                         })
                     })
+                },
+            )
+            .flat_map(|results| {
+                Io::suspend(move || {
+                    print_comparison(&results);
+                    Ok(())
                 })
             })
+    })
+}
+
+/// Load cached activations for a single layer and train.
+fn sweep_one_layer_cached(
+    layer: usize,
+    device: candle_core::Device,
+    hyper: SweepHyperParams,
+    prefix: String,
+) -> Io<Error, TrainMetrics> {
+    Io::suspend(move || {
+        eprintln!("\n=== layer {layer} (cached) ===");
+        let model_dim = ModelDim::GPT2_SMALL;
+        let sae_dim = SaeDim::from_expansion(model_dim, hyper.expansion)?;
+        let acts_path = format!("{prefix}activations_layer_{layer}.safetensors");
+        eprintln!("loading activations from {acts_path}...");
+        let tensors = candle_core::safetensors::load(std::path::Path::new(&acts_path), &device)?;
+        let count = tensors.len();
+        let activations: Vec<Tensor> = (0..count)
+            .map(|i| {
+                let key = format!("batch_{i}");
+                tensors
+                    .get(&key)
+                    .ok_or_else(|| Error::Boundary {
+                        reason: format!("missing tensor `{key}` in {acts_path}"),
+                    })
+                    .and_then(|t| t.to_dtype(DType::F32).map_err(Error::from))
+            })
+            .collect::<Result<_, _>>()?;
+        eprintln!("loaded {} activation batches", activations.len());
+        Ok((activations, device, model_dim, sae_dim, layer, prefix))
+    })
+    .flat_map(
+        move |(activations, device, model_dim, sae_dim, layer, prefix)| {
+            train_layer(
+                activations,
+                device,
+                model_dim,
+                sae_dim,
+                layer,
+                hyper,
+                prefix,
+            )
         },
     )
 }
@@ -214,6 +308,7 @@ fn sweep_layers(
         layers,
         hyper,
         prefix,
+        save_acts,
         ..
     } = opts;
     layers
@@ -226,7 +321,7 @@ fn sweep_layers(
                 let device = device.clone();
                 let prefix = prefix.clone();
                 acc.flat_map(move |results| {
-                    sweep_one_layer(layer, weights, batches, device, hyper, prefix).map(
+                    sweep_one_layer(layer, weights, batches, device, hyper, prefix, save_acts).map(
                         move |metrics| {
                             results
                                 .into_iter()
@@ -246,6 +341,10 @@ fn sweep_layers(
 }
 
 /// Train a single SAE at the given layer and return final metrics.
+///
+/// When `save_acts` is true, activations are saved to
+/// `{prefix}activations_layer_{layer}.safetensors` before training.
+#[allow(clippy::too_many_arguments)]
 fn sweep_one_layer(
     layer: usize,
     weights: Arc<Vec<u8>>,
@@ -253,6 +352,7 @@ fn sweep_one_layer(
     device: candle_core::Device,
     hyper: SweepHyperParams,
     prefix: String,
+    save_acts: bool,
 ) -> Io<Error, TrainMetrics> {
     Io::suspend(move || {
         eprintln!("\n=== layer {layer} ===");
@@ -269,15 +369,26 @@ fn sweep_one_layer(
             activation_stream(gpt2, batches)
                 .collect()
                 .flat_map(move |activations| {
-                    train_layer(
-                        activations,
-                        device,
-                        model_dim,
-                        sae_dim,
-                        layer,
-                        hyper,
-                        prefix,
-                    )
+                    let save_io: Io<Error, ()> = if save_acts {
+                        let acts_path = format!("{prefix}activations_layer_{layer}.safetensors");
+                        io_boundary::save_activations(
+                            activations.clone(),
+                            std::path::PathBuf::from(acts_path),
+                        )
+                    } else {
+                        Io::pure(())
+                    };
+                    save_io.flat_map(move |()| {
+                        train_layer(
+                            activations,
+                            device,
+                            model_dim,
+                            sae_dim,
+                            layer,
+                            hyper,
+                            prefix,
+                        )
+                    })
                 })
         },
     )
@@ -367,11 +478,23 @@ fn train_layer(
                         })
                     },
                     |metrics| {
-                        io_boundary::save_checkpoint(
-                            sae_for_save,
-                            std::path::PathBuf::from(checkpoint_path),
-                        )
-                        .map(move |()| metrics)
+                        let ckpt = std::path::PathBuf::from(checkpoint_path);
+                        let meta = io_boundary::CheckpointMeta::from_metrics(
+                            &metrics,
+                            layer,
+                            model_dim.as_usize(),
+                            sae_dim.as_usize(),
+                            hyper.l1_coeff,
+                            hyper.lr_peak,
+                            hyper.lr_min,
+                            hyper.warmup_steps,
+                            hyper.num_steps,
+                            hyper.resample_interval,
+                        );
+                        let meta_file = io_boundary::meta_path(&ckpt);
+                        io_boundary::save_checkpoint(sae_for_save, ckpt)
+                            .flat_map(move |()| io_boundary::save_checkpoint_meta(meta, meta_file))
+                            .map(move |()| metrics)
                     },
                 )
             })

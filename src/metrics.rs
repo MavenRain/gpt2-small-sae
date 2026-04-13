@@ -207,3 +207,148 @@ impl TrainMetrics {
         Ok(format!("{}\n", serde_json::to_string(&record)?))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    // -- L0 -----------------------------------------------------------------
+
+    #[test]
+    fn l0_all_zeros() -> Result<(), Error> {
+        let features = Tensor::zeros((4, 8), DType::F32, &Device::Cpu)?;
+        let l0 = L0::compute(&features)?;
+        assert!((l0.as_f64() - 0.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn l0_all_positive() -> Result<(), Error> {
+        let features = Tensor::ones((4, 8), DType::F32, &Device::Cpu)?;
+        let l0 = L0::compute(&features)?;
+        assert!((l0.as_f64() - 8.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn l0_half_active() -> Result<(), Error> {
+        // 2 tokens, 4 features: first two features active, last two zero.
+        let data: Vec<f32> = vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0];
+        let features = Tensor::from_vec(data, (2, 4), &Device::Cpu)?;
+        let l0 = L0::compute(&features)?;
+        assert!((l0.as_f64() - 2.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    // -- Mse ----------------------------------------------------------------
+
+    #[test]
+    fn mse_identical_tensors() -> Result<(), Error> {
+        let t = Tensor::ones((4, 8), DType::F32, &Device::Cpu)?;
+        let mse = Mse::compute(&t, &t)?;
+        assert!((mse.as_f64() - 0.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn mse_known_value() -> Result<(), Error> {
+        let a = Tensor::zeros((2, 2), DType::F32, &Device::Cpu)?;
+        let b = Tensor::ones((2, 2), DType::F32, &Device::Cpu)?;
+        let mse = Mse::compute(&a, &b)?;
+        // MSE of all-zeros vs all-ones = 1.0
+        assert!((mse.as_f64() - 1.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    // -- VarianceExplained --------------------------------------------------
+
+    #[test]
+    fn var_explained_perfect_reconstruction() -> Result<(), Error> {
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let t = Tensor::from_vec(data, (2, 2), &Device::Cpu)?;
+        let ve = VarianceExplained::compute(&t, &t)?;
+        assert!((ve.as_f64() - 1.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn var_explained_zero_reconstruction() -> Result<(), Error> {
+        // Reconstructing with zeros should explain no variance.
+        let target_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let target = Tensor::from_vec(target_data, (2, 2), &Device::Cpu)?;
+        let recon = Tensor::zeros((2, 2), DType::F32, &Device::Cpu)?;
+        let ve = VarianceExplained::compute(&recon, &target)?;
+        assert!(ve.as_f64() < 1.0);
+        Ok(())
+    }
+
+    // -- DeadFraction -------------------------------------------------------
+
+    #[test]
+    fn dead_fraction_all_dead() -> Result<(), Error> {
+        let counts = Tensor::zeros(8, DType::F32, &Device::Cpu)?;
+        let df = DeadFraction::compute(&counts)?;
+        assert!((df.as_f64() - 1.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn dead_fraction_none_dead() -> Result<(), Error> {
+        let counts = Tensor::ones(8, DType::F32, &Device::Cpu)?;
+        let df = DeadFraction::compute(&counts)?;
+        assert!((df.as_f64() - 0.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn dead_fraction_half_dead() -> Result<(), Error> {
+        let data: Vec<f32> = vec![0.0, 0.0, 1.0, 1.0];
+        let counts = Tensor::from_vec(data, 4, &Device::Cpu)?;
+        let df = DeadFraction::compute(&counts)?;
+        assert!((df.as_f64() - 0.5).abs() < 1e-6);
+        Ok(())
+    }
+
+    // -- TrainMetrics -------------------------------------------------------
+
+    #[test]
+    fn train_metrics_getters() {
+        let m = TrainMetrics::new(
+            42,
+            L0(10.0),
+            Mse(0.5),
+            VarianceExplained(0.9),
+            DeadFraction(0.1),
+            3e-4,
+            5,
+        );
+        assert_eq!(m.step(), 42);
+        assert!((m.l0().as_f64() - 10.0).abs() < 1e-12);
+        assert!((m.mse().as_f64() - 0.5).abs() < 1e-12);
+        assert!((m.variance_explained().as_f64() - 0.9).abs() < 1e-12);
+        assert!((m.dead_fraction().as_f64() - 0.1).abs() < 1e-12);
+        assert!((m.learning_rate() - 3e-4).abs() < 1e-12);
+        assert_eq!(m.resampled(), 5);
+    }
+
+    #[test]
+    fn train_metrics_to_jsonl() -> Result<(), Error> {
+        let m = TrainMetrics::new(
+            10,
+            L0(5.0),
+            Mse(0.1),
+            VarianceExplained(0.95),
+            DeadFraction(0.02),
+            1e-4,
+            0,
+        );
+        let line = m.to_jsonl()?;
+        assert!(line.ends_with('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim())?;
+        assert_eq!(parsed["step"], 10);
+        assert_eq!(parsed["l0"], 5.0);
+        assert_eq!(parsed["mse"], 0.1);
+        Ok(())
+    }
+}

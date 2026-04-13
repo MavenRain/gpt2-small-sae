@@ -288,6 +288,7 @@ fn train_program() -> Io<Error, ()> {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn init_and_train(
     activations: Vec<Tensor>,
     device: candle_core::Device,
@@ -331,15 +332,15 @@ fn init_and_train(
         std::fs::write(&opts.metrics_path, "")?;
         Ok((stream, sae_for_save, opts))
     })
-    .flat_map(|(stream, sae_for_save, opts)| {
+    .flat_map(move |(stream, sae_for_save, opts)| {
         eprintln!("training...\n");
         let metrics_path = opts.metrics_path.clone();
         let log_every = opts.log_every;
         let num_steps = opts.num_steps;
         stream
             .fold(
-                (),
-                Arc::new(move |(), metrics: TrainMetrics| {
+                None::<TrainMetrics>,
+                Arc::new(move |_, metrics: TrainMetrics| {
                     // Append every step to the JSONL log (best-effort).
                     if let Ok(line) = metrics.to_jsonl() {
                         let _ = std::fs::OpenOptions::new()
@@ -365,12 +366,36 @@ fn init_and_train(
                             metrics.resampled(),
                         );
                     }
+                    Some(metrics)
                 }),
             )
-            .flat_map(move |()| {
-                io_boundary::save_checkpoint(
-                    sae_for_save,
-                    std::path::PathBuf::from(checkpoint_path),
+            .flat_map(move |final_metrics| {
+                let ckpt = std::path::PathBuf::from(checkpoint_path);
+                final_metrics.map_or_else(
+                    || {
+                        Io::suspend(|| {
+                            Err(Error::Train {
+                                reason: "no training steps completed".into(),
+                            })
+                        })
+                    },
+                    |metrics| {
+                        let meta = io_boundary::CheckpointMeta::from_metrics(
+                            &metrics,
+                            opts.layer,
+                            model_dim.as_usize(),
+                            sae_dim.as_usize(),
+                            opts.l1_coeff,
+                            opts.lr_peak,
+                            opts.lr_min,
+                            opts.warmup_steps,
+                            opts.num_steps,
+                            opts.resample_interval,
+                        );
+                        let meta_file = io_boundary::meta_path(&ckpt);
+                        io_boundary::save_checkpoint(sae_for_save, ckpt)
+                            .flat_map(move |()| io_boundary::save_checkpoint_meta(meta, meta_file))
+                    },
                 )
             })
     })

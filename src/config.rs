@@ -265,3 +265,166 @@ impl SaeTrainConfig {
         self.context_length
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- ModelDim -----------------------------------------------------------
+
+    #[test]
+    fn model_dim_valid() -> Result<(), Error> {
+        let d = ModelDim::new(768)?;
+        assert_eq!(d.as_usize(), 768);
+        Ok(())
+    }
+
+    #[test]
+    fn model_dim_zero_rejected() {
+        assert!(ModelDim::new(0).is_err());
+    }
+
+    #[test]
+    fn model_dim_gpt2_small_constant() {
+        assert_eq!(ModelDim::GPT2_SMALL.as_usize(), 768);
+    }
+
+    // -- SaeDim -------------------------------------------------------------
+
+    #[test]
+    fn sae_dim_valid() -> Result<(), Error> {
+        let d = SaeDim::new(6144)?;
+        assert_eq!(d.as_usize(), 6144);
+        Ok(())
+    }
+
+    #[test]
+    fn sae_dim_zero_rejected() {
+        assert!(SaeDim::new(0).is_err());
+    }
+
+    #[test]
+    fn sae_dim_from_expansion() -> Result<(), Error> {
+        let dim = SaeDim::from_expansion(ModelDim::GPT2_SMALL, 8)?;
+        assert_eq!(dim.as_usize(), 768 * 8);
+        Ok(())
+    }
+
+    #[test]
+    fn sae_dim_zero_expansion_rejected() {
+        assert!(SaeDim::from_expansion(ModelDim::GPT2_SMALL, 0).is_err());
+    }
+
+    // -- LayerIndex ---------------------------------------------------------
+
+    #[test]
+    fn layer_index_valid_range() -> Result<(), Error> {
+        assert_eq!(LayerIndex::new(0, 12)?.as_usize(), 0);
+        assert_eq!(LayerIndex::new(11, 12)?.as_usize(), 11);
+        Ok(())
+    }
+
+    #[test]
+    fn layer_index_at_depth_rejected() {
+        assert!(LayerIndex::new(12, 12).is_err());
+    }
+
+    #[test]
+    fn layer_index_beyond_depth_rejected() {
+        assert!(LayerIndex::new(100, 12).is_err());
+    }
+
+    // -- L1Coefficient ------------------------------------------------------
+
+    #[test]
+    fn l1_coefficient_valid() -> Result<(), Error> {
+        let c = L1Coefficient::new(5e-4)?;
+        assert!((c.as_f64() - 5e-4).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn l1_coefficient_zero_rejected() {
+        assert!(L1Coefficient::new(0.0).is_err());
+    }
+
+    #[test]
+    fn l1_coefficient_negative_rejected() {
+        assert!(L1Coefficient::new(-1.0).is_err());
+    }
+
+    #[test]
+    fn l1_coefficient_infinity_rejected() {
+        assert!(L1Coefficient::new(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn l1_coefficient_nan_rejected() {
+        assert!(L1Coefficient::new(f64::NAN).is_err());
+    }
+
+    // -- LearningRate -------------------------------------------------------
+
+    #[test]
+    fn learning_rate_valid() -> Result<(), Error> {
+        let r = LearningRate::new(3e-4)?;
+        assert!((r.as_f64() - 3e-4).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn learning_rate_zero_rejected() {
+        assert!(LearningRate::new(0.0).is_err());
+    }
+
+    #[test]
+    fn learning_rate_nan_rejected() {
+        assert!(LearningRate::new(f64::NAN).is_err());
+    }
+
+    // -- BatchSize ----------------------------------------------------------
+
+    #[test]
+    fn batch_size_valid() -> Result<(), Error> {
+        let b = BatchSize::new(4)?;
+        assert_eq!(b.as_usize(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_size_zero_rejected() {
+        assert!(BatchSize::new(0).is_err());
+    }
+
+    // -- ContextLength ------------------------------------------------------
+
+    #[test]
+    fn context_length_valid() -> Result<(), Error> {
+        let c = ContextLength::new(128)?;
+        assert_eq!(c.as_usize(), 128);
+        Ok(())
+    }
+
+    #[test]
+    fn context_length_zero_rejected() {
+        assert!(ContextLength::new(0).is_err());
+    }
+
+    // -- SaeTrainConfig -----------------------------------------------------
+
+    #[test]
+    fn sae_train_config_roundtrip() {
+        let cfg = SaeTrainConfig::new(
+            ModelDim::GPT2_SMALL,
+            SaeDim(6144),
+            L1Coefficient(5e-4),
+            LearningRate(3e-4),
+            BatchSize(4),
+            ContextLength(128),
+        );
+        assert_eq!(cfg.model_dim(), ModelDim::GPT2_SMALL);
+        assert_eq!(cfg.sae_dim().as_usize(), 6144);
+        assert_eq!(cfg.batch_size().as_usize(), 4);
+        assert_eq!(cfg.context_length().as_usize(), 128);
+    }
+}

@@ -302,10 +302,12 @@ fn inspect_features(
         summaries.get(summary_idx).map_or(
             Ok::<_, Error>(()),
             |(feat_idx, max_act, fire_count, top_hits)| {
+                let label = generate_label(top_hits, all_token_ids, tokenizer)?;
                 eprintln!(
                     "=== feature {feat_idx} (max: {max_act:.4}, \
                      fired: {fire_count}/{total_tokens} tokens) ==="
                 );
+                eprintln!("  label: {label}");
                 top_hits.iter().try_for_each(|&(act, global_pos)| {
                     let context = decode_context(
                         all_token_ids,
@@ -356,42 +358,42 @@ fn write_dashboard(
     n_active: usize,
     opts: &InspectOpts,
 ) -> Result<(), Error> {
-    let features_json: Vec<serde_json::Value> = top_indices
+    let features_json: Result<Vec<serde_json::Value>, Error> = top_indices
         .iter()
-        .filter_map(|&idx| {
-            summaries
-                .get(idx)
-                .map(|(feat_idx, max_act, fire_count, top_hits)| {
-                    let tokens_json: Vec<serde_json::Value> = top_hits
-                        .iter()
-                        .filter_map(|&(act, pos)| {
-                            decode_context(
-                                all_token_ids,
-                                pos,
-                                tokenizer,
-                                opts.ctx_len,
-                                opts.context_window,
-                            )
-                            .ok()
-                            .map(|ctx| {
-                                serde_json::json!({
-                                    "activation": act,
-                                    "position": pos,
-                                    "context": ctx,
-                                })
-                            })
+        .filter_map(|&idx| summaries.get(idx))
+        .map(|(feat_idx, max_act, fire_count, top_hits)| {
+            let label = generate_label(top_hits, all_token_ids, tokenizer)?;
+            let tokens_json: Vec<serde_json::Value> = top_hits
+                .iter()
+                .filter_map(|&(act, pos)| {
+                    decode_context(
+                        all_token_ids,
+                        pos,
+                        tokenizer,
+                        opts.ctx_len,
+                        opts.context_window,
+                    )
+                    .ok()
+                    .map(|ctx| {
+                        serde_json::json!({
+                            "activation": act,
+                            "position": pos,
+                            "context": ctx,
                         })
-                        .collect();
-                    serde_json::json!({
-                        "index": feat_idx,
-                        "max_activation": max_act,
-                        "fire_count": fire_count,
-                        "fire_rate": *fire_count as f64 / total_tokens.max(1) as f64,
-                        "top_tokens": tokens_json,
                     })
                 })
+                .collect();
+            Ok(serde_json::json!({
+                "index": feat_idx,
+                "label": label,
+                "max_activation": max_act,
+                "fire_count": fire_count,
+                "fire_rate": *fire_count as f64 / total_tokens.max(1) as f64,
+                "top_tokens": tokens_json,
+            }))
         })
         .collect();
+    let features_json = features_json?;
 
     let dashboard = serde_json::json!({
         "checkpoint": opts.checkpoint,
@@ -408,6 +410,86 @@ fn write_dashboard(
     std::fs::write(path, formatted)?;
     eprintln!("dashboard written to {path}");
     Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Feature auto-labeling
+// -----------------------------------------------------------------------
+
+/// Generate a short human-readable label for a feature based on the
+/// tokens that activate it most strongly.
+///
+/// When one token dominates (>50% of top-K hits), the label is that
+/// token in quotes.  Otherwise, the top three most frequent tokens
+/// are listed separated by slashes.
+#[allow(clippy::cast_precision_loss)]
+fn generate_label(
+    top_hits: &[(f32, usize)],
+    all_token_ids: &[u32],
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<String, Error> {
+    let center_tokens: Vec<String> = top_hits
+        .iter()
+        .filter_map(|&(_, pos)| {
+            all_token_ids
+                .get(pos)
+                .and_then(|&id| tokenizer.decode(&[id], false).ok())
+        })
+        .collect();
+
+    if center_tokens.is_empty() {
+        return Ok("(no tokens)".into());
+    }
+
+    // Count token frequencies via fold.  Each step increments the
+    // existing entry (if found) and appends a new one (if not).
+    let token_counts: Vec<(String, usize)> =
+        center_tokens
+            .into_iter()
+            .fold(Vec::<(String, usize)>::new(), |acc, tok| {
+                let found = acc.iter().position(|(t, _)| *t == tok);
+                let tail = found.is_none().then_some((tok, 1)).into_iter();
+                acc.into_iter()
+                    .enumerate()
+                    .map(|(j, (t, c))| {
+                        let new_c = found.filter(|&i| i == j).map_or(c, |_| c + 1);
+                        (t, new_c)
+                    })
+                    .chain(tail)
+                    .collect()
+            });
+
+    // Rank by count descending.
+    let ranked: Vec<(String, usize)> = std::collections::BinaryHeap::from(
+        token_counts
+            .into_iter()
+            .map(|(t, c)| (c, t))
+            .collect::<Vec<_>>(),
+    )
+    .into_sorted_vec()
+    .into_iter()
+    .rev()
+    .map(|(c, t)| (t, c))
+    .collect();
+
+    let total: usize = ranked.iter().map(|(_, c)| c).sum();
+
+    ranked.first().map_or_else(
+        || Ok("(empty)".into()),
+        |(top_tok, top_count)| {
+            let trimmed = top_tok.trim();
+            if *top_count as f64 / total.max(1) as f64 > 0.5 {
+                Ok(format!("\"{trimmed}\""))
+            } else {
+                Ok(ranked
+                    .iter()
+                    .take(3)
+                    .map(|(t, _)| format!("\"{}\"", t.trim()))
+                    .collect::<Vec<_>>()
+                    .join(" / "))
+            }
+        },
+    )
 }
 
 // -----------------------------------------------------------------------

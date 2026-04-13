@@ -792,3 +792,110 @@ fn train_step(state: TrainState) -> Result<Option<(TrainMetrics, TrainState)>, E
 
     Ok(Some((metrics, new_state)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LearningRate;
+
+    // -- AdamConfig ---------------------------------------------------------
+
+    #[test]
+    fn adam_config_standard_values() {
+        let cfg = AdamConfig::standard();
+        assert!((cfg.beta1() - 0.9).abs() < 1e-12);
+        assert!((cfg.beta2() - 0.999).abs() < 1e-12);
+        assert!((cfg.eps() - 1e-8).abs() < 1e-20);
+        assert!((cfg.weight_decay() - 0.01).abs() < 1e-12);
+    }
+
+    // -- LrSchedule ---------------------------------------------------------
+
+    #[test]
+    fn lr_schedule_constant() -> Result<(), Error> {
+        let lr = LearningRate::new(3e-4)?;
+        let sched = LrSchedule::constant(lr, 1000);
+        // Every step should return the same rate.
+        assert!((sched.at_step(0) - 3e-4).abs() < 1e-10);
+        assert!((sched.at_step(500) - 3e-4).abs() < 1e-10);
+        assert!((sched.at_step(999) - 3e-4).abs() < 1e-10);
+        Ok(())
+    }
+
+    #[test]
+    fn lr_schedule_warmup_ramp() -> Result<(), Error> {
+        let peak = LearningRate::new(1e-3)?;
+        let floor = LearningRate::new(1e-4)?;
+        let sched = LrSchedule::new(peak, floor, 100, 1000)?;
+        // Step 0: lr = peak * 0/100 = 0
+        assert!((sched.at_step(0) - 0.0).abs() < 1e-12);
+        // Step 50: lr = peak * 50/100 = 5e-4
+        assert!((sched.at_step(50) - 5e-4).abs() < 1e-10);
+        // Step 100: boundary; cosine decay starts at peak
+        assert!((sched.at_step(100) - 1e-3).abs() < 1e-10);
+        Ok(())
+    }
+
+    #[test]
+    fn lr_schedule_cosine_decay_endpoints() -> Result<(), Error> {
+        let peak = LearningRate::new(1e-3)?;
+        let floor = LearningRate::new(1e-4)?;
+        let sched = LrSchedule::new(peak, floor, 0, 1000)?;
+        // Step 0 (no warmup): full peak
+        assert!((sched.at_step(0) - 1e-3).abs() < 1e-10);
+        // Last step: should reach close to floor
+        assert!((sched.at_step(1000) - 1e-4).abs() < 1e-10);
+        Ok(())
+    }
+
+    #[test]
+    fn lr_schedule_cosine_decay_midpoint() -> Result<(), Error> {
+        let peak = LearningRate::new(1e-3)?;
+        let floor = LearningRate::new(1e-4)?;
+        let sched = LrSchedule::new(peak, floor, 0, 1000)?;
+        // Midpoint of cosine: cos(pi * 0.5) = 0, so lr = 0.5*(peak-floor) + floor
+        let expected = 0.5 * (1e-3 - 1e-4) + 1e-4;
+        assert!((sched.at_step(500) - expected).abs() < 1e-10);
+        Ok(())
+    }
+
+    #[test]
+    fn lr_schedule_rejects_warmup_ge_total() -> Result<(), Error> {
+        let peak = LearningRate::new(1e-3)?;
+        let floor = LearningRate::new(1e-4)?;
+        assert!(LrSchedule::new(peak, floor, 1000, 1000).is_err());
+        assert!(LrSchedule::new(peak, floor, 1001, 1000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lr_schedule_rejects_min_gt_peak() -> Result<(), Error> {
+        let peak = LearningRate::new(1e-4)?;
+        let floor = LearningRate::new(1e-3)?;
+        assert!(LrSchedule::new(peak, floor, 0, 1000).is_err());
+        Ok(())
+    }
+
+    // -- ResampleConfig -----------------------------------------------------
+
+    #[test]
+    fn resample_config_valid() {
+        assert!(ResampleConfig::new(500).is_ok());
+    }
+
+    #[test]
+    fn resample_config_zero_rejected() {
+        assert!(ResampleConfig::new(0).is_err());
+    }
+
+    #[test]
+    fn resample_should_fire_at_interval() -> Result<(), Error> {
+        let cfg = ResampleConfig::new(100)?;
+        assert!(!cfg.should_resample(0));
+        assert!(!cfg.should_resample(50));
+        assert!(cfg.should_resample(100));
+        assert!(!cfg.should_resample(150));
+        assert!(cfg.should_resample(200));
+        Ok(())
+    }
+}

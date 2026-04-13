@@ -15,6 +15,7 @@ use comp_cat_rs::effect::io::Io;
 use crate::config::LayerIndex;
 use crate::error::{Error, TokenizerError};
 use crate::gpt2::Gpt2;
+use crate::metrics::TrainMetrics;
 use crate::sae::Sae;
 
 const GPT2_REPO: &str = "openai-community/gpt2";
@@ -149,5 +150,97 @@ pub fn load_activations(path: std::path::PathBuf, device: Device) -> Io<Error, V
                     .and_then(|t| t.to_dtype(DType::F32).map_err(Error::from))
             })
             .collect()
+    })
+}
+
+/// Metadata sidecar for an SAE checkpoint.  Saved alongside the
+/// safetensors file as `{stem}.meta.json` so the checkpoint is
+/// self-documenting.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointMeta {
+    /// GPT-2 hookpoint layer.
+    pub layer: usize,
+    /// Model residual stream width.
+    pub model_dim: usize,
+    /// SAE dictionary width.
+    pub sae_dim: usize,
+    /// L1 sparsity coefficient.
+    pub l1_coefficient: f64,
+    /// Peak learning rate.
+    pub lr_peak: f64,
+    /// Minimum learning rate (cosine floor).
+    pub lr_min: f64,
+    /// Linear warmup steps.
+    pub warmup_steps: u64,
+    /// Total training steps.
+    pub total_steps: u64,
+    /// Dead feature resample interval (0 = disabled).
+    pub resample_interval: u64,
+    /// Final MSE at end of training.
+    pub final_mse: f64,
+    /// Final L0 sparsity.
+    pub final_l0: f64,
+    /// Final variance explained.
+    pub final_var_explained: f64,
+    /// Final dead fraction.
+    pub final_dead_fraction: f64,
+}
+
+impl CheckpointMeta {
+    /// Construct metadata from final [`TrainMetrics`] and raw
+    /// hyperparameters.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_metrics(
+        metrics: &TrainMetrics,
+        layer: usize,
+        model_dim: usize,
+        sae_dim: usize,
+        l1_coefficient: f64,
+        lr_peak: f64,
+        lr_min: f64,
+        warmup_steps: u64,
+        total_steps: u64,
+        resample_interval: u64,
+    ) -> Self {
+        Self {
+            layer,
+            model_dim,
+            sae_dim,
+            l1_coefficient,
+            lr_peak,
+            lr_min,
+            warmup_steps,
+            total_steps,
+            resample_interval,
+            final_mse: metrics.mse().as_f64(),
+            final_l0: metrics.l0().as_f64(),
+            final_var_explained: metrics.variance_explained().as_f64(),
+            final_dead_fraction: metrics.dead_fraction().as_f64(),
+        }
+    }
+}
+
+/// Derive the metadata sidecar path from a checkpoint path.
+///
+/// `sae_checkpoint.safetensors` becomes `sae_checkpoint.meta.json`.
+#[must_use]
+pub fn meta_path(checkpoint_path: &std::path::Path) -> std::path::PathBuf {
+    checkpoint_path.with_extension("meta.json")
+}
+
+/// Save checkpoint metadata as a JSON sidecar file.
+///
+/// # Errors
+///
+/// Returns [`Error::Json`] on serialization failure, or
+/// [`Error::Io`] if the file cannot be written.
+#[must_use]
+pub fn save_checkpoint_meta(meta: CheckpointMeta, path: std::path::PathBuf) -> Io<Error, ()> {
+    Io::suspend(move || {
+        let json = serde_json::to_string_pretty(&meta)?;
+        std::fs::write(&path, json)?;
+        eprintln!("saved metadata to {}", path.display());
+        Ok(())
     })
 }

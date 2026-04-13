@@ -38,6 +38,10 @@ path = "src/bin/sweep.rs"
 name = "plot"
 path = "src/bin/plot.rs"
 
+[[bin]]
+name = "l1_sweep"
+path = "src/bin/l1_sweep.rs"
+
 [dependencies]
 comp-cat-rs = "0.5"
 
