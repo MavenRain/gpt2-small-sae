@@ -34,6 +34,10 @@ path = "src/bin/inspect.rs"
 name = "sweep"
 path = "src/bin/sweep.rs"
 
+[[bin]]
+name = "plot"
+path = "src/bin/plot.rs"
+
 [dependencies]
 comp-cat-rs = "0.5"
 

@@ -337,6 +337,42 @@ pub fn adam_step(
 }
 
 // ---------------------------------------------------------------------------
+// resume_from_checkpoint
+// ---------------------------------------------------------------------------
+
+/// Load SAE weights from a safetensors checkpoint into an existing
+/// [`VarMap`], overwriting the current parameter values.
+///
+/// This enables resuming training from a prior checkpoint: the
+/// `VarMap`'s [`Var`]s share storage with the [`Sae`] tensors, so
+/// setting them updates the model in place.  The optimizer state
+/// (moments) is not restored; call this before [`AdamState::init`]
+/// so the optimizer starts fresh with the loaded weights.
+///
+/// # Errors
+///
+/// Returns [`Error::Train`] if the `VarMap` mutex is poisoned or a
+/// checkpoint tensor name does not match any model variable.  Returns
+/// [`Error::Candle`] if tensor loading or dtype conversion fails.
+pub fn resume_from_checkpoint(
+    varmap: &VarMap,
+    path: &std::path::Path,
+    device: &Device,
+) -> Result<(), Error> {
+    let tensors = candle_core::safetensors::load(path, device)?;
+    let data = varmap.data().lock().map_err(|e| Error::Train {
+        reason: format!("failed to lock VarMap: {e}"),
+    })?;
+    tensors.iter().try_for_each(|(name, tensor)| {
+        data.get(name)
+            .ok_or_else(|| Error::Train {
+                reason: format!("checkpoint tensor `{name}` not found in model"),
+            })
+            .and_then(|var| var.set(&tensor.to_dtype(DType::F32)?).map_err(Error::from))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // normalize_decoder
 // ---------------------------------------------------------------------------
 

@@ -33,7 +33,9 @@ use gpt2_small_sae::gpt2::Gpt2;
 use gpt2_small_sae::io_boundary;
 use gpt2_small_sae::metrics::TrainMetrics;
 use gpt2_small_sae::sae::Sae;
-use gpt2_small_sae::train::{AdamConfig, AdamState, LrSchedule, ResampleConfig, training_stream};
+use gpt2_small_sae::train::{
+    AdamConfig, AdamState, LrSchedule, ResampleConfig, resume_from_checkpoint, training_stream,
+};
 
 const GPT2_DEPTH: usize = 12;
 const VOCAB_UPPER: f32 = 50256.0;
@@ -56,6 +58,7 @@ struct TrainOpts {
     corpus: Option<std::path::PathBuf>,
     checkpoint: String,
     metrics_path: String,
+    resume: Option<String>,
 }
 
 fn parse_train_opts() -> Result<TrainOpts, Error> {
@@ -79,6 +82,7 @@ fn parse_train_opts() -> Result<TrainOpts, Error> {
             .map(std::path::PathBuf::from),
         checkpoint: args.get_or("checkpoint", "sae_checkpoint.safetensors".to_string())?,
         metrics_path: args.get_or("metrics", "metrics.jsonl".to_string())?,
+        resume: args.get("resume").map(String::from),
     })
 }
 
@@ -256,6 +260,11 @@ fn init_and_train(
         let varmap = candle_nn::VarMap::new();
         let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let sae = Sae::new(vb, model_dim, sae_dim)?;
+        opts.resume.as_deref().map_or(Ok::<_, Error>(()), |path| {
+            resume_from_checkpoint(&varmap, std::path::Path::new(path), &device)?;
+            eprintln!("resumed from checkpoint: {path}");
+            Ok(())
+        })?;
         let sae_for_save = sae.clone();
         let adam = AdamState::init(&varmap)?;
         let resample_config = (opts.resample_interval > 0)
