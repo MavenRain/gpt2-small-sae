@@ -46,6 +46,10 @@ path = "src/bin/l1_sweep.rs"
 name = "patch_eval"
 path = "src/bin/patch_eval.rs"
 
+[[bin]]
+name = "expansion_sweep"
+path = "src/bin/expansion_sweep.rs"
+
 [dependencies]
 comp-cat-rs = "0.5"
 
