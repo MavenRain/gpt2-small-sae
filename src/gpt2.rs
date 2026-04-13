@@ -17,6 +17,7 @@ use candle_nn::{self, LayerNorm, LayerNormConfig, Module, VarBuilder};
 
 use crate::config::LayerIndex;
 use crate::error::Error;
+use crate::sae::Sae;
 
 const VOCAB_SIZE: usize = 50257;
 const MAX_POSITION: usize = 1024;
@@ -24,6 +25,7 @@ const N_HEAD: usize = 12;
 const D_MODEL: usize = 768;
 const D_HEAD: usize = D_MODEL / N_HEAD;
 const D_MLP: usize = D_MODEL * 4;
+const GPT2_DEPTH: usize = 12;
 
 /// Frozen GPT-2 small model truncated at a chosen layer hookpoint.
 #[derive(Debug, Clone)]
@@ -32,6 +34,23 @@ pub struct Gpt2 {
     wte: candle_nn::Embedding,
     wpe: candle_nn::Embedding,
     blocks: Vec<Block>,
+}
+
+/// Full GPT-2 small model with all 12 transformer blocks, the final
+/// layer norm (`ln_f`), and a tied LM head for next-token prediction.
+///
+/// Unlike [`Gpt2`], which truncates at a hookpoint and returns the
+/// residual stream, `Gpt2Full` produces logits for cross-entropy loss
+/// computation.  Its [`patched_logits`](Self::patched_logits) method
+/// supports splicing an [`Sae`] reconstruction into the residual stream
+/// at a chosen layer for activation patching evaluation.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct Gpt2Full {
+    wte: candle_nn::Embedding,
+    wpe: candle_nn::Embedding,
+    blocks: Vec<Block>,
+    ln_f: LayerNorm,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +142,128 @@ impl Gpt2 {
         self.blocks
             .iter()
             .try_fold(hidden, |h, block| block.forward(&h, batch, seq_len, device))
+    }
+}
+
+impl Gpt2Full {
+    /// Load the full GPT-2 small model (all 12 blocks) from a
+    /// [`VarBuilder`] backed by pretrained safetensors data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Candle`] if expected tensors are missing or have
+    /// wrong shapes.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(vb: VarBuilder) -> Result<Self, Error> {
+        let wte = candle_nn::embedding(VOCAB_SIZE, D_MODEL, vb.pp("wte"))?;
+        let wpe = candle_nn::embedding(MAX_POSITION, D_MODEL, vb.pp("wpe"))?;
+        let h = vb.pp("h");
+        let blocks = (0..GPT2_DEPTH)
+            .map(|i| Block::new(h.pp(i.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ln_config = LayerNormConfig::default();
+        let ln_f = candle_nn::layer_norm(D_MODEL, ln_config, vb.pp("ln_f"))?;
+        Ok(Self {
+            wte,
+            wpe,
+            blocks,
+            ln_f,
+        })
+    }
+
+    /// Load from raw safetensors bytes on `device`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Candle`] if the bytes are not valid safetensors or
+    /// contain unexpected shapes.
+    pub fn from_bytes(data: Vec<u8>, device: &Device) -> Result<Self, Error> {
+        let vb = VarBuilder::from_buffered_safetensors(data, DType::F32, device)?;
+        Self::new(vb)
+    }
+
+    /// Full forward pass returning logits of shape
+    /// `(batch, seq_len, 50257)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Shape`] if `input_ids` is not 2-D, or
+    /// [`Error::Candle`] on tensor operation failure.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn logits(&self, input_ids: &Tensor) -> Result<Tensor, Error> {
+        let (hidden, batch, seq_len) = self.embed(input_ids)?;
+        let device = input_ids.device();
+        let final_hidden = self
+            .blocks
+            .iter()
+            .try_fold(hidden, |h, block| block.forward(&h, batch, seq_len, device))?;
+        self.head(&final_hidden, batch, seq_len)
+    }
+
+    /// Forward pass with an [`Sae`] spliced at `hook_layer`.
+    ///
+    /// Runs blocks `0..hook_layer`, replaces the residual with the SAE
+    /// reconstruction, then continues blocks `hook_layer..12` through
+    /// `ln_f` and the tied LM head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Shape`] if `input_ids` is not 2-D, or
+    /// [`Error::Candle`] on tensor operation failure.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn patched_logits(
+        &self,
+        input_ids: &Tensor,
+        sae: &Sae,
+        hook_layer: LayerIndex,
+    ) -> Result<Tensor, Error> {
+        let (hidden, batch, seq_len) = self.embed(input_ids)?;
+        let device = input_ids.device();
+        let hook = hook_layer.as_usize();
+        let pre_hook = self
+            .blocks
+            .iter()
+            .take(hook)
+            .try_fold(hidden, |h, block| block.forward(&h, batch, seq_len, device))?;
+        let reconstruction = sae.forward(&pre_hook)?.reconstruction().clone();
+        let post_hook = self
+            .blocks
+            .iter()
+            .skip(hook)
+            .try_fold(reconstruction, |h, block| {
+                block.forward(&h, batch, seq_len, device)
+            })?;
+        self.head(&post_hook, batch, seq_len)
+    }
+
+    /// Embed token IDs into hidden states.
+    #[allow(clippy::cast_possible_truncation)]
+    fn embed(&self, input_ids: &Tensor) -> Result<(Tensor, usize, usize), Error> {
+        let (batch, seq_len) = match input_ids.dims() {
+            [b, s] => Ok((*b, *s)),
+            other => Err(Error::Shape {
+                what: "gpt2 input_ids",
+                expected: vec![0, 0],
+                actual: other.to_vec(),
+            }),
+        }?;
+        let device = input_ids.device();
+        let position_ids = Tensor::arange(0u32, seq_len as u32, device)?;
+        let token_emb = self.wte.forward(input_ids)?;
+        let pos_emb = self.wpe.forward(&position_ids)?;
+        let hidden = token_emb.broadcast_add(&pos_emb)?;
+        Ok((hidden, batch, seq_len))
+    }
+
+    /// Apply final layer norm and the tied LM head.
+    fn head(&self, hidden: &Tensor, batch: usize, seq_len: usize) -> Result<Tensor, Error> {
+        let normed = self.ln_f.forward(hidden)?;
+        let wte_weight = self.wte.embeddings();
+        let flat = normed.reshape((batch * seq_len, D_MODEL))?;
+        let logits_flat = flat.matmul(&wte_weight.t()?)?;
+        logits_flat
+            .reshape((batch, seq_len, VOCAB_SIZE))
+            .map_err(Error::from)
     }
 }
 

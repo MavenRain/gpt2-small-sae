@@ -42,6 +42,10 @@ path = "src/bin/plot.rs"
 name = "l1_sweep"
 path = "src/bin/l1_sweep.rs"
 
+[[bin]]
+name = "patch_eval"
+path = "src/bin/patch_eval.rs"
+
 [dependencies]
 comp-cat-rs = "0.5"
 
