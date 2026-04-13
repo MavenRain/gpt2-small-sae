@@ -1,15 +1,17 @@
 //! SAE training binary.
 //!
 //! Downloads GPT-2 small, collects residual stream activations, trains
-//! a sparse autoencoder, saves a checkpoint to
-//! `sae_checkpoint.safetensors`, and writes per-step metrics to
-//! `metrics.jsonl`.
+//! a sparse autoencoder, saves a checkpoint to a safetensors file, and
+//! writes per-step metrics to a JSONL file.
 //!
 //! # Usage
 //!
 //! ```text
 //! # Train on a text corpus (recommended):
-//! cargo run --release --bin train -- corpus.txt
+//! cargo run --release --bin train -- --corpus corpus.txt
+//!
+//! # Train with custom hyperparameters:
+//! cargo run --release --bin train -- --corpus corpus.txt --layer 4 --expansion 16
 //!
 //! # Train on random token IDs (baseline / smoke test):
 //! cargo run --release --bin train
@@ -21,6 +23,7 @@ use candle_core::{DType, Tensor};
 use comp_cat_rs::effect::io::Io;
 
 use gpt2_small_sae::activations::activation_stream;
+use gpt2_small_sae::cli::Args;
 use gpt2_small_sae::config::{
     BatchSize, ContextLength, L1Coefficient, LayerIndex, LearningRate, ModelDim, SaeDim,
 };
@@ -32,25 +35,51 @@ use gpt2_small_sae::metrics::TrainMetrics;
 use gpt2_small_sae::sae::Sae;
 use gpt2_small_sae::train::{AdamConfig, AdamState, LrSchedule, ResampleConfig, training_stream};
 
-const LAYER: usize = 8;
 const GPT2_DEPTH: usize = 12;
-const EXPANSION: usize = 8;
-const L1_COEFF: f64 = 5e-4;
-const LR_PEAK: f64 = 3e-4;
-const LR_MIN: f64 = 3e-5;
-const WARMUP_STEPS: u64 = 500;
-const BATCH_SIZE: usize = 4;
-const CTX_LEN: usize = 128;
-const NUM_RANDOM_BATCHES: usize = 16;
-const NUM_STEPS: u64 = 5000;
-const RESAMPLE_INTERVAL: u64 = 500;
-const LOG_EVERY: u64 = 100;
 const VOCAB_UPPER: f32 = 50256.0;
-const METRICS_PATH: &str = "metrics.jsonl";
 
-/// Resolve the corpus path from argv, if any.
-fn corpus_path() -> Option<std::path::PathBuf> {
-    std::env::args().nth(1).map(std::path::PathBuf::from)
+/// All CLI-configurable training options.
+#[derive(Clone)]
+struct TrainOpts {
+    layer: usize,
+    expansion: usize,
+    l1_coeff: f64,
+    lr_peak: f64,
+    lr_min: f64,
+    warmup_steps: u64,
+    batch_size: usize,
+    ctx_len: usize,
+    num_batches: usize,
+    num_steps: u64,
+    resample_interval: u64,
+    log_every: u64,
+    corpus: Option<std::path::PathBuf>,
+    checkpoint: String,
+    metrics_path: String,
+}
+
+fn parse_train_opts() -> Result<TrainOpts, Error> {
+    let args = Args::parse();
+    Ok(TrainOpts {
+        layer: args.get_or("layer", 8_usize)?,
+        expansion: args.get_or("expansion", 8_usize)?,
+        l1_coeff: args.get_or("l1", 5e-4_f64)?,
+        lr_peak: args.get_or("lr-peak", 3e-4_f64)?,
+        lr_min: args.get_or("lr-min", 3e-5_f64)?,
+        warmup_steps: args.get_or("warmup", 500_u64)?,
+        batch_size: args.get_or("batch-size", 4_usize)?,
+        ctx_len: args.get_or("ctx-len", 128_usize)?,
+        num_batches: args.get_or("batches", 16_usize)?,
+        num_steps: args.get_or("steps", 5000_u64)?,
+        resample_interval: args.get_or("resample", 500_u64)?,
+        log_every: args.get_or("log-every", 100_u64)?,
+        corpus: args
+            .get("corpus")
+            .or_else(|| args.positional(0))
+            .map(std::path::PathBuf::from),
+        checkpoint: args.get_or("checkpoint", "sae_checkpoint.safetensors".to_string())?,
+        metrics_path: args.get_or("metrics", "metrics.jsonl".to_string())?,
+    })
 }
 
 // -----------------------------------------------------------------------
@@ -61,21 +90,23 @@ fn corpus_path() -> Option<std::path::PathBuf> {
 fn batches_from_corpus(
     path: &std::path::Path,
     tokenizer: &tokenizers::Tokenizer,
+    batch_size: usize,
+    ctx_len: usize,
     device: &candle_core::Device,
 ) -> Result<Vec<Tensor>, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error::Boundary {
         reason: format!("failed to read corpus {}: {e}", path.display()),
     })?;
-    let batch_size = BatchSize::new(BATCH_SIZE)?;
-    let ctx_len = ContextLength::new(CTX_LEN)?;
-    let batches = tokenize_corpus(&text, tokenizer, batch_size, ctx_len, device)?;
+    let bs = BatchSize::new(batch_size)?;
+    let cl = ContextLength::new(ctx_len)?;
+    let batches = tokenize_corpus(&text, tokenizer, bs, cl, device)?;
     if batches.is_empty() {
         Err(Error::Boundary {
             reason: format!(
                 "corpus {} is too short to fill even one batch \
-                 ({BATCH_SIZE} x {CTX_LEN} = {} tokens needed)",
+                 ({batch_size} x {ctx_len} = {} tokens needed)",
                 path.display(),
-                BATCH_SIZE * CTX_LEN
+                batch_size * ctx_len
             ),
         })
     } else {
@@ -84,10 +115,15 @@ fn batches_from_corpus(
 }
 
 /// Generate random token-ID batches as a baseline fallback.
-fn batches_random(device: &candle_core::Device) -> Result<Vec<Tensor>, Error> {
-    (0..NUM_RANDOM_BATCHES)
+fn batches_random(
+    num_batches: usize,
+    batch_size: usize,
+    ctx_len: usize,
+    device: &candle_core::Device,
+) -> Result<Vec<Tensor>, Error> {
+    (0..num_batches)
         .map(|_| {
-            Tensor::rand(0.0f32, VOCAB_UPPER, (BATCH_SIZE, CTX_LEN), device)
+            Tensor::rand(0.0f32, VOCAB_UPPER, (batch_size, ctx_len), device)
                 .and_then(|t| t.to_dtype(DType::U32))
                 .map_err(Error::from)
         })
@@ -98,70 +134,110 @@ fn batches_random(device: &candle_core::Device) -> Result<Vec<Tensor>, Error> {
 // Main Io program
 // -----------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn train_program() -> Io<Error, ()> {
-    let maybe_corpus = corpus_path();
-    io_boundary::acquire_device().flat_map(move |device| {
-        io_boundary::download_gpt2_weights().flat_map(move |weights| {
-            let maybe_corpus = maybe_corpus.clone();
-            let needs_tokenizer = maybe_corpus.is_some();
-            let tokenizer_io: Io<Error, Option<tokenizers::Tokenizer>> = if needs_tokenizer {
-                io_boundary::download_tokenizer().map(Some)
-            } else {
-                Io::pure(None)
-            };
-            tokenizer_io.flat_map(move |maybe_tokenizer| {
-                Io::suspend(move || {
-                    let layer_index = LayerIndex::new(LAYER, GPT2_DEPTH)?;
-                    let model_dim = ModelDim::GPT2_SMALL;
-                    let sae_dim = SaeDim::from_expansion(model_dim, EXPANSION)?;
+    parse_train_opts().map_or_else(
+        |e| Io::suspend(move || Err(e)),
+        |opts| {
+            let needs_tokenizer = opts.corpus.is_some();
+            io_boundary::acquire_device().flat_map(move |device| {
+                let opts = opts.clone();
+                io_boundary::download_gpt2_weights().flat_map(move |weights| {
+                    let opts = opts.clone();
+                    let tokenizer_io: Io<Error, Option<tokenizers::Tokenizer>> = if needs_tokenizer
+                    {
+                        io_boundary::download_tokenizer().map(Some)
+                    } else {
+                        Io::pure(None)
+                    };
+                    tokenizer_io.flat_map(move |maybe_tokenizer| {
+                        let opts2 = opts.clone();
+                        Io::suspend(move || {
+                            let layer_index = LayerIndex::new(opts.layer, GPT2_DEPTH)?;
+                            let model_dim = ModelDim::GPT2_SMALL;
+                            let sae_dim = SaeDim::from_expansion(model_dim, opts.expansion)?;
 
-                    let batches = maybe_corpus.as_deref().map_or_else(
-                        || {
-                            eprintln!("=== SAE training (random tokens) ===");
+                            let batches = opts.corpus.as_deref().map_or_else(
+                                || {
+                                    eprintln!("=== SAE training (random tokens) ===");
+                                    eprintln!(
+                                        "  hint: pass --corpus <file> for real-corpus training"
+                                    );
+                                    batches_random(
+                                        opts.num_batches,
+                                        opts.batch_size,
+                                        opts.ctx_len,
+                                        &device,
+                                    )
+                                },
+                                |path| {
+                                    eprintln!("=== SAE training (corpus: {}) ===", path.display());
+                                    let tokenizer = maybe_tokenizer.as_ref().ok_or_else(|| {
+                                        Error::Boundary {
+                                            reason: "tokenizer not loaded".into(),
+                                        }
+                                    })?;
+                                    batches_from_corpus(
+                                        path,
+                                        tokenizer,
+                                        opts.batch_size,
+                                        opts.ctx_len,
+                                        &device,
+                                    )
+                                },
+                            )?;
+
                             eprintln!(
-                                "  hint: pass a text file as the first argument \
-                                 for real-corpus training"
+                                "layer: {}, expansion: {}x, \
+                                 l1: {}, lr_peak: {}, lr_min: {}",
+                                opts.layer,
+                                opts.expansion,
+                                opts.l1_coeff,
+                                opts.lr_peak,
+                                opts.lr_min,
                             );
-                            batches_random(&device)
-                        },
-                        |path| {
-                            eprintln!("=== SAE training (corpus: {}) ===", path.display());
-                            let tokenizer =
-                                maybe_tokenizer.as_ref().ok_or_else(|| Error::Boundary {
-                                    reason: "tokenizer not loaded".into(),
-                                })?;
-                            batches_from_corpus(path, tokenizer, &device)
-                        },
-                    )?;
+                            eprintln!(
+                                "warmup: {}, resample: every {}, \
+                                 batches: {} x {} x {}, steps: {}",
+                                opts.warmup_steps,
+                                opts.resample_interval,
+                                batches.len(),
+                                opts.batch_size,
+                                opts.ctx_len,
+                                opts.num_steps,
+                            );
+                            eprintln!();
 
-                    eprintln!(
-                        "layer: {LAYER}, expansion: {EXPANSION}x, \
-                         l1: {L1_COEFF}, lr_peak: {LR_PEAK}, lr_min: {LR_MIN}"
-                    );
-                    eprintln!(
-                        "warmup: {WARMUP_STEPS}, resample: every {RESAMPLE_INTERVAL}, \
-                         batches: {} x {BATCH_SIZE} x {CTX_LEN}, steps: {NUM_STEPS}",
-                        batches.len()
-                    );
-                    eprintln!();
+                            eprintln!("loading GPT-2 small (layers 0..{})...", opts.layer);
+                            let gpt2 = Gpt2::from_bytes(weights, layer_index, &device)?;
 
-                    eprintln!("loading GPT-2 small (layers 0..{LAYER})...");
-                    let gpt2 = Gpt2::from_bytes(weights, layer_index, &device)?;
-
-                    Ok((gpt2, batches, device, model_dim, sae_dim))
-                })
-                .flat_map(|(gpt2, batches, device, model_dim, sae_dim)| {
-                    eprintln!("collecting activations through GPT-2...");
-                    activation_stream(gpt2, batches)
-                        .collect()
-                        .flat_map(move |activations| {
-                            eprintln!("collected {} activation batches", activations.len());
-                            init_and_train(activations, device, model_dim, sae_dim)
+                            Ok((gpt2, batches, device, model_dim, sae_dim))
                         })
+                        .flat_map(
+                            move |(gpt2, batches, device, model_dim, sae_dim)| {
+                                eprintln!("collecting activations through GPT-2...");
+                                activation_stream(gpt2, batches).collect().flat_map(
+                                    move |activations| {
+                                        eprintln!(
+                                            "collected {} activation batches",
+                                            activations.len()
+                                        );
+                                        init_and_train(
+                                            activations,
+                                            device,
+                                            model_dim,
+                                            sae_dim,
+                                            opts2,
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                    })
                 })
             })
-        })
-    })
+        },
+    )
 }
 
 fn init_and_train(
@@ -169,18 +245,22 @@ fn init_and_train(
     device: candle_core::Device,
     model_dim: ModelDim,
     sae_dim: SaeDim,
+    opts: TrainOpts,
 ) -> Io<Error, ()> {
+    let checkpoint_path = opts.checkpoint.clone();
     Io::suspend(move || {
-        let l1_coefficient = L1Coefficient::new(L1_COEFF)?;
-        let lr_peak = LearningRate::new(LR_PEAK)?;
-        let lr_min = LearningRate::new(LR_MIN)?;
-        let lr_schedule = LrSchedule::new(lr_peak, lr_min, WARMUP_STEPS, NUM_STEPS)?;
+        let l1_coefficient = L1Coefficient::new(opts.l1_coeff)?;
+        let lr_peak = LearningRate::new(opts.lr_peak)?;
+        let lr_min = LearningRate::new(opts.lr_min)?;
+        let lr_schedule = LrSchedule::new(lr_peak, lr_min, opts.warmup_steps, opts.num_steps)?;
         let varmap = candle_nn::VarMap::new();
         let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let sae = Sae::new(vb, model_dim, sae_dim)?;
         let sae_for_save = sae.clone();
         let adam = AdamState::init(&varmap)?;
-        let resample_config = Some(ResampleConfig::new(RESAMPLE_INTERVAL)?);
+        let resample_config = (opts.resample_interval > 0)
+            .then(|| ResampleConfig::new(opts.resample_interval))
+            .transpose()?;
         let stream = training_stream(
             sae,
             adam,
@@ -191,31 +271,34 @@ fn init_and_train(
             AdamConfig::standard(),
             model_dim,
             sae_dim,
-            NUM_STEPS,
+            opts.num_steps,
             resample_config,
         )?;
         // Truncate any prior metrics file.
-        std::fs::write(METRICS_PATH, "")?;
-        Ok((stream, sae_for_save))
+        std::fs::write(&opts.metrics_path, "")?;
+        Ok((stream, sae_for_save, opts))
     })
-    .flat_map(|(stream, sae_for_save)| {
+    .flat_map(|(stream, sae_for_save, opts)| {
         eprintln!("training...\n");
+        let metrics_path = opts.metrics_path.clone();
+        let log_every = opts.log_every;
+        let num_steps = opts.num_steps;
         stream
             .fold(
                 (),
-                Arc::new(|(), metrics: TrainMetrics| {
+                Arc::new(move |(), metrics: TrainMetrics| {
                     // Append every step to the JSONL log (best-effort).
                     if let Ok(line) = metrics.to_jsonl() {
                         let _ = std::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
-                            .open(METRICS_PATH)
+                            .open(&metrics_path)
                             .and_then(|mut f| {
                                 use std::io::Write;
                                 f.write_all(line.as_bytes())
                             });
                     }
-                    if metrics.step() % LOG_EVERY == 0 || metrics.step() == NUM_STEPS - 1 {
+                    if metrics.step() % log_every == 0 || metrics.step() == num_steps - 1 {
                         eprintln!(
                             "step {:>5} | mse: {:.6} | l0: {:>7.1} | \
                              var_expl: {:>7.4} | dead: {:.4} | lr: {:.2e} | \
@@ -234,7 +317,7 @@ fn init_and_train(
             .flat_map(move |()| {
                 io_boundary::save_checkpoint(
                     sae_for_save,
-                    std::path::PathBuf::from("sae_checkpoint.safetensors"),
+                    std::path::PathBuf::from(checkpoint_path),
                 )
             })
     })

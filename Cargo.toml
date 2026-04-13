@@ -26,6 +26,14 @@ path = "src/bin/train.rs"
 name = "eval_pretrained"
 path = "src/bin/eval_pretrained.rs"
 
+[[bin]]
+name = "inspect"
+path = "src/bin/inspect.rs"
+
+[[bin]]
+name = "sweep"
+path = "src/bin/sweep.rs"
+
 [dependencies]
 comp-cat-rs = "0.5"
 

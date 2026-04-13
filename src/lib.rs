@@ -38,6 +38,7 @@
 #![deny(missing_docs)]
 
 pub mod activations;
+pub mod cli;
 pub mod config;
 pub mod dataset;
 pub mod error;
