@@ -26,6 +26,8 @@
 //! - [`sae`] defines the [`sae::Sae`] model, its forward pass, and its loss.
 //! - [`gpt2`] wraps the pretrained GPT-2 small model and exposes the residual
 //!   stream at a chosen layer.
+//! - [`dataset`] tokenizes a text corpus and chunks it into fixed-size
+//!   token-ID batches for the GPT-2 forward pass.
 //! - [`activations`] exposes a residual stream as a
 //!   [`comp_cat_rs::effect::stream::Stream`] for the training loop to fold
 //!   over.
@@ -37,8 +39,10 @@
 
 pub mod activations;
 pub mod config;
+pub mod dataset;
 pub mod error;
 pub mod gpt2;
 pub mod io_boundary;
 pub mod metrics;
 pub mod sae;
+pub mod train;

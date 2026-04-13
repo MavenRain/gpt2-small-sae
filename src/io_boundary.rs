@@ -6,6 +6,8 @@
 //! here.  Binary entry points compose these programs with combinators and
 //! call [`Io::run`] exactly once at the top level.
 
+use std::collections::HashMap;
+
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use comp_cat_rs::effect::io::Io;
@@ -13,6 +15,7 @@ use comp_cat_rs::effect::io::Io;
 use crate::config::LayerIndex;
 use crate::error::{Error, TokenizerError};
 use crate::gpt2::Gpt2;
+use crate::sae::Sae;
 
 const GPT2_REPO: &str = "openai-community/gpt2";
 
@@ -76,5 +79,26 @@ pub fn load_safetensors(
     Io::suspend(move || {
         let data = std::fs::read(&path)?;
         VarBuilder::from_buffered_safetensors(data, DType::F32, &device).map_err(Error::from)
+    })
+}
+
+/// Save an [`Sae`] checkpoint to a safetensors file.
+///
+/// # Errors
+///
+/// Returns [`Error::Candle`] on serialization failure, or
+/// [`Error::Io`] if the file cannot be written.
+#[must_use]
+pub fn save_checkpoint(sae: Sae, path: std::path::PathBuf) -> Io<Error, ()> {
+    Io::suspend(move || {
+        let tensors = HashMap::from([
+            ("w_enc".to_string(), sae.w_enc().clone()),
+            ("b_enc".to_string(), sae.b_enc().clone()),
+            ("w_dec".to_string(), sae.w_dec().clone()),
+            ("b_dec".to_string(), sae.b_dec().clone()),
+        ]);
+        candle_core::safetensors::save(&tensors, &path)?;
+        eprintln!("saved checkpoint to {}", path.display());
+        Ok(())
     })
 }

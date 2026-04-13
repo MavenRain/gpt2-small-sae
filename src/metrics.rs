@@ -40,6 +40,8 @@ pub struct TrainMetrics {
     mse: Mse,
     variance_explained: VarianceExplained,
     dead_fraction: DeadFraction,
+    learning_rate: f64,
+    resampled: u64,
 }
 
 impl L0 {
@@ -135,6 +137,8 @@ impl TrainMetrics {
         mse: Mse,
         variance_explained: VarianceExplained,
         dead_fraction: DeadFraction,
+        learning_rate: f64,
+        resampled: u64,
     ) -> Self {
         Self {
             step,
@@ -142,6 +146,8 @@ impl TrainMetrics {
             mse,
             variance_explained,
             dead_fraction,
+            learning_rate,
+            resampled,
         }
     }
 
@@ -171,6 +177,18 @@ impl TrainMetrics {
         self.dead_fraction
     }
 
+    /// The learning rate used for this step.
+    #[must_use]
+    pub fn learning_rate(&self) -> f64 {
+        self.learning_rate
+    }
+
+    /// Number of features resampled at this step (0 on non-resample steps).
+    #[must_use]
+    pub fn resampled(&self) -> u64 {
+        self.resampled
+    }
+
     /// Render the metrics as a JSONL line.
     ///
     /// # Errors
@@ -183,6 +201,8 @@ impl TrainMetrics {
             "mse": self.mse.as_f64(),
             "var_explained": self.variance_explained.as_f64(),
             "dead_fraction": self.dead_fraction.as_f64(),
+            "lr": self.learning_rate,
+            "resampled": self.resampled,
         });
         Ok(format!("{}\n", serde_json::to_string(&record)?))
     }
