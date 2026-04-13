@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use comp_cat_rs::effect::io::Io;
 
@@ -100,5 +100,54 @@ pub fn save_checkpoint(sae: Sae, path: std::path::PathBuf) -> Io<Error, ()> {
         candle_core::safetensors::save(&tensors, &path)?;
         eprintln!("saved checkpoint to {}", path.display());
         Ok(())
+    })
+}
+
+/// Save collected activation tensors to a safetensors file.
+///
+/// Tensors are named `batch_0`, `batch_1`, etc.  Use
+/// [`load_activations`] to reload them.
+///
+/// # Errors
+///
+/// Returns [`Error::Candle`] on serialization failure, or
+/// [`Error::Io`] if the file cannot be written.
+#[must_use]
+pub fn save_activations(activations: Vec<Tensor>, path: std::path::PathBuf) -> Io<Error, ()> {
+    Io::suspend(move || {
+        let count = activations.len();
+        let tensors: HashMap<String, Tensor> = activations
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| (format!("batch_{i}"), t))
+            .collect();
+        candle_core::safetensors::save(&tensors, &path)?;
+        eprintln!("saved {count} activation batches to {}", path.display());
+        Ok(())
+    })
+}
+
+/// Load activation tensors previously written by [`save_activations`].
+///
+/// # Errors
+///
+/// Returns [`Error::Boundary`] if any expected `batch_N` tensor is
+/// missing, or [`Error::Candle`] on tensor loading failure.
+#[must_use]
+pub fn load_activations(path: std::path::PathBuf, device: Device) -> Io<Error, Vec<Tensor>> {
+    Io::suspend(move || {
+        let tensors = candle_core::safetensors::load(&path, &device)?;
+        let count = tensors.len();
+        (0..count)
+            .map(|i| {
+                let key = format!("batch_{i}");
+                tensors
+                    .get(&key)
+                    .ok_or_else(|| Error::Boundary {
+                        reason: format!("missing tensor `{key}` in {}", path.display()),
+                    })
+                    .and_then(|t| t.to_dtype(DType::F32).map_err(Error::from))
+            })
+            .collect()
     })
 }

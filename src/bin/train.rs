@@ -59,6 +59,8 @@ struct TrainOpts {
     checkpoint: String,
     metrics_path: String,
     resume: Option<String>,
+    save_acts: Option<String>,
+    load_acts: Option<String>,
 }
 
 fn parse_train_opts() -> Result<TrainOpts, Error> {
@@ -83,6 +85,8 @@ fn parse_train_opts() -> Result<TrainOpts, Error> {
         checkpoint: args.get_or("checkpoint", "sae_checkpoint.safetensors".to_string())?,
         metrics_path: args.get_or("metrics", "metrics.jsonl".to_string())?,
         resume: args.get("resume").map(String::from),
+        save_acts: args.get("save-acts").map(String::from),
+        load_acts: args.get("load-acts").map(String::from),
     })
 }
 
@@ -135,110 +139,150 @@ fn batches_random(
 }
 
 // -----------------------------------------------------------------------
+// Activation production (fresh or cached)
+// -----------------------------------------------------------------------
+
+/// Load pre-cached activations from a safetensors file, skipping
+/// GPT-2 entirely.
+fn load_cached_activations(
+    path: String,
+    expansion: usize,
+    device: candle_core::Device,
+) -> Io<Error, (Vec<Tensor>, candle_core::Device, ModelDim, SaeDim)> {
+    Io::suspend(move || {
+        let model_dim = ModelDim::GPT2_SMALL;
+        let sae_dim = SaeDim::from_expansion(model_dim, expansion)?;
+        eprintln!("=== SAE training (cached activations) ===");
+        eprintln!("loading activations from {path}...");
+        let tensors = candle_core::safetensors::load(std::path::Path::new(&path), &device)?;
+        let count = tensors.len();
+        let activations: Vec<Tensor> = (0..count)
+            .map(|i| {
+                let key = format!("batch_{i}");
+                tensors
+                    .get(&key)
+                    .ok_or_else(|| Error::Boundary {
+                        reason: format!("missing tensor `{key}` in {path}"),
+                    })
+                    .and_then(|t| t.to_dtype(DType::F32).map_err(Error::from))
+            })
+            .collect::<Result<_, _>>()?;
+        eprintln!("loaded {} activation batches", activations.len());
+        eprintln!();
+        Ok((activations, device, model_dim, sae_dim))
+    })
+}
+
+/// Download GPT-2, tokenize input, run forward pass, and optionally
+/// save the collected activations to disk.
+#[allow(clippy::too_many_lines)]
+fn collect_fresh_activations(
+    opts: TrainOpts,
+    device: candle_core::Device,
+) -> Io<Error, (Vec<Tensor>, candle_core::Device, ModelDim, SaeDim)> {
+    let needs_tokenizer = opts.corpus.is_some();
+    io_boundary::download_gpt2_weights().flat_map(move |weights| {
+        let tokenizer_io: Io<Error, Option<tokenizers::Tokenizer>> = if needs_tokenizer {
+            io_boundary::download_tokenizer().map(Some)
+        } else {
+            Io::pure(None)
+        };
+        tokenizer_io.flat_map(move |maybe_tokenizer| {
+            let save_acts = opts.save_acts.clone();
+            Io::suspend(move || {
+                let layer_index = LayerIndex::new(opts.layer, GPT2_DEPTH)?;
+                let model_dim = ModelDim::GPT2_SMALL;
+                let sae_dim = SaeDim::from_expansion(model_dim, opts.expansion)?;
+
+                let batches = opts.corpus.as_deref().map_or_else(
+                    || {
+                        eprintln!("=== SAE training (random tokens) ===");
+                        eprintln!("  hint: pass --corpus <file> for real-corpus training");
+                        batches_random(opts.num_batches, opts.batch_size, opts.ctx_len, &device)
+                    },
+                    |path| {
+                        eprintln!("=== SAE training (corpus: {}) ===", path.display());
+                        let tokenizer =
+                            maybe_tokenizer.as_ref().ok_or_else(|| Error::Boundary {
+                                reason: "tokenizer not loaded".into(),
+                            })?;
+                        batches_from_corpus(path, tokenizer, opts.batch_size, opts.ctx_len, &device)
+                    },
+                )?;
+
+                eprintln!(
+                    "layer: {}, expansion: {}x, \
+                     l1: {}, lr_peak: {}, lr_min: {}",
+                    opts.layer, opts.expansion, opts.l1_coeff, opts.lr_peak, opts.lr_min,
+                );
+                eprintln!(
+                    "warmup: {}, resample: every {}, \
+                     batches: {} x {} x {}, steps: {}",
+                    opts.warmup_steps,
+                    opts.resample_interval,
+                    batches.len(),
+                    opts.batch_size,
+                    opts.ctx_len,
+                    opts.num_steps,
+                );
+                eprintln!();
+
+                eprintln!("loading GPT-2 small (layers 0..{})...", opts.layer);
+                let gpt2 = Gpt2::from_bytes(weights, layer_index, &device)?;
+
+                Ok((gpt2, batches, device, model_dim, sae_dim))
+            })
+            .flat_map(move |(gpt2, batches, device, model_dim, sae_dim)| {
+                eprintln!("collecting activations through GPT-2...");
+                activation_stream(gpt2, batches)
+                    .collect()
+                    .flat_map(move |activations| {
+                        eprintln!("collected {} activation batches", activations.len());
+                        let save_io: Io<Error, ()> = save_acts.map_or_else(
+                            || Io::pure(()),
+                            |path| {
+                                io_boundary::save_activations(
+                                    activations.clone(),
+                                    std::path::PathBuf::from(path),
+                                )
+                            },
+                        );
+                        save_io.map(move |()| (activations, device, model_dim, sae_dim))
+                    })
+            })
+        })
+    })
+}
+
+/// Branch on `--load-acts` to either load cached activations or run
+/// the full GPT-2 pipeline.
+fn produce_activations(
+    opts: TrainOpts,
+    device: candle_core::Device,
+) -> Io<Error, (Vec<Tensor>, candle_core::Device, ModelDim, SaeDim)> {
+    let expansion = opts.expansion;
+    let device_for_cache = device.clone();
+    opts.load_acts.clone().map_or_else(
+        || collect_fresh_activations(opts, device),
+        |path| load_cached_activations(path, expansion, device_for_cache),
+    )
+}
+
+// -----------------------------------------------------------------------
 // Main Io program
 // -----------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
 fn train_program() -> Io<Error, ()> {
     parse_train_opts().map_or_else(
         |e| Io::suspend(move || Err(e)),
         |opts| {
-            let needs_tokenizer = opts.corpus.is_some();
+            let opts_for_train = opts.clone();
             io_boundary::acquire_device().flat_map(move |device| {
-                let opts = opts.clone();
-                io_boundary::download_gpt2_weights().flat_map(move |weights| {
-                    let opts = opts.clone();
-                    let tokenizer_io: Io<Error, Option<tokenizers::Tokenizer>> = if needs_tokenizer
-                    {
-                        io_boundary::download_tokenizer().map(Some)
-                    } else {
-                        Io::pure(None)
-                    };
-                    tokenizer_io.flat_map(move |maybe_tokenizer| {
-                        let opts2 = opts.clone();
-                        Io::suspend(move || {
-                            let layer_index = LayerIndex::new(opts.layer, GPT2_DEPTH)?;
-                            let model_dim = ModelDim::GPT2_SMALL;
-                            let sae_dim = SaeDim::from_expansion(model_dim, opts.expansion)?;
-
-                            let batches = opts.corpus.as_deref().map_or_else(
-                                || {
-                                    eprintln!("=== SAE training (random tokens) ===");
-                                    eprintln!(
-                                        "  hint: pass --corpus <file> for real-corpus training"
-                                    );
-                                    batches_random(
-                                        opts.num_batches,
-                                        opts.batch_size,
-                                        opts.ctx_len,
-                                        &device,
-                                    )
-                                },
-                                |path| {
-                                    eprintln!("=== SAE training (corpus: {}) ===", path.display());
-                                    let tokenizer = maybe_tokenizer.as_ref().ok_or_else(|| {
-                                        Error::Boundary {
-                                            reason: "tokenizer not loaded".into(),
-                                        }
-                                    })?;
-                                    batches_from_corpus(
-                                        path,
-                                        tokenizer,
-                                        opts.batch_size,
-                                        opts.ctx_len,
-                                        &device,
-                                    )
-                                },
-                            )?;
-
-                            eprintln!(
-                                "layer: {}, expansion: {}x, \
-                                 l1: {}, lr_peak: {}, lr_min: {}",
-                                opts.layer,
-                                opts.expansion,
-                                opts.l1_coeff,
-                                opts.lr_peak,
-                                opts.lr_min,
-                            );
-                            eprintln!(
-                                "warmup: {}, resample: every {}, \
-                                 batches: {} x {} x {}, steps: {}",
-                                opts.warmup_steps,
-                                opts.resample_interval,
-                                batches.len(),
-                                opts.batch_size,
-                                opts.ctx_len,
-                                opts.num_steps,
-                            );
-                            eprintln!();
-
-                            eprintln!("loading GPT-2 small (layers 0..{})...", opts.layer);
-                            let gpt2 = Gpt2::from_bytes(weights, layer_index, &device)?;
-
-                            Ok((gpt2, batches, device, model_dim, sae_dim))
-                        })
-                        .flat_map(
-                            move |(gpt2, batches, device, model_dim, sae_dim)| {
-                                eprintln!("collecting activations through GPT-2...");
-                                activation_stream(gpt2, batches).collect().flat_map(
-                                    move |activations| {
-                                        eprintln!(
-                                            "collected {} activation batches",
-                                            activations.len()
-                                        );
-                                        init_and_train(
-                                            activations,
-                                            device,
-                                            model_dim,
-                                            sae_dim,
-                                            opts2,
-                                        )
-                                    },
-                                )
-                            },
-                        )
-                    })
-                })
+                produce_activations(opts, device).flat_map(
+                    move |(activations, device, model_dim, sae_dim)| {
+                        init_and_train(activations, device, model_dim, sae_dim, opts_for_train)
+                    },
+                )
             })
         },
     )
