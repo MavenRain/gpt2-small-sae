@@ -290,3 +290,218 @@ impl Loss {
         &self.l1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const MODEL_DIM: usize = 4;
+    const SAE_DIM: usize = 8;
+
+    fn cpu() -> Device {
+        Device::Cpu
+    }
+
+    fn fresh_sae(device: &Device) -> Result<Sae, Error> {
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        Sae::new(vb, ModelDim::new(MODEL_DIM)?, SaeDim::new(SAE_DIM)?)
+    }
+
+    fn sae_from_tensors(tensors: HashMap<String, Tensor>, device: &Device) -> Result<Sae, Error> {
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        Sae::new(vb, ModelDim::new(MODEL_DIM)?, SaeDim::new(SAE_DIM)?)
+    }
+
+    /// Hand-crafted SAE with all parameters set to zero, so every forward
+    /// pass produces zero features and a zero reconstruction regardless
+    /// of the input.
+    fn zero_sae(device: &Device) -> Result<Sae, Error> {
+        let tensors: HashMap<String, Tensor> = [
+            (
+                "w_enc".to_string(),
+                Tensor::zeros((MODEL_DIM, SAE_DIM), DType::F32, device)?,
+            ),
+            (
+                "b_enc".to_string(),
+                Tensor::zeros((SAE_DIM,), DType::F32, device)?,
+            ),
+            (
+                "w_dec".to_string(),
+                Tensor::zeros((SAE_DIM, MODEL_DIM), DType::F32, device)?,
+            ),
+            (
+                "b_dec".to_string(),
+                Tensor::zeros((MODEL_DIM,), DType::F32, device)?,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        sae_from_tensors(tensors, device)
+    }
+
+    /// Hand-crafted SAE with `b_enc = 1` and zero weights, so every
+    /// forward pass produces an all-ones feature activation regardless
+    /// of the input (making the L1 penalty analytically predictable).
+    fn unit_bias_sae(device: &Device) -> Result<Sae, Error> {
+        let tensors: HashMap<String, Tensor> = [
+            (
+                "w_enc".to_string(),
+                Tensor::zeros((MODEL_DIM, SAE_DIM), DType::F32, device)?,
+            ),
+            (
+                "b_enc".to_string(),
+                Tensor::ones((SAE_DIM,), DType::F32, device)?,
+            ),
+            (
+                "w_dec".to_string(),
+                Tensor::zeros((SAE_DIM, MODEL_DIM), DType::F32, device)?,
+            ),
+            (
+                "b_dec".to_string(),
+                Tensor::zeros((MODEL_DIM,), DType::F32, device)?,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        sae_from_tensors(tensors, device)
+    }
+
+    // -- forward shape & error handling ------------------------------------
+
+    #[test]
+    fn forward_shape_3d() -> Result<(), Error> {
+        let device = cpu();
+        let sae = fresh_sae(&device)?;
+        let x = Tensor::zeros((2, 3, MODEL_DIM), DType::F32, &device)?;
+        let out = sae.forward(&x)?;
+        assert_eq!(out.features().dims(), &[2, 3, SAE_DIM]);
+        assert_eq!(out.reconstruction().dims(), &[2, 3, MODEL_DIM]);
+        Ok(())
+    }
+
+    #[test]
+    fn forward_shape_2d() -> Result<(), Error> {
+        let device = cpu();
+        let sae = fresh_sae(&device)?;
+        let x = Tensor::zeros((5, MODEL_DIM), DType::F32, &device)?;
+        let out = sae.forward(&x)?;
+        assert_eq!(out.features().dims(), &[5, SAE_DIM]);
+        assert_eq!(out.reconstruction().dims(), &[5, MODEL_DIM]);
+        Ok(())
+    }
+
+    #[test]
+    fn forward_wrong_trailing_dim_errors() -> Result<(), Error> {
+        let device = cpu();
+        let sae = fresh_sae(&device)?;
+        let bad = Tensor::zeros((2, 3, MODEL_DIM + 1), DType::F32, &device)?;
+        assert!(matches!(sae.forward(&bad), Err(Error::Shape { .. })));
+        Ok(())
+    }
+
+    // -- forward numerical invariants --------------------------------------
+
+    #[test]
+    fn forward_features_non_negative() -> Result<(), Error> {
+        let device = cpu();
+        let sae = fresh_sae(&device)?;
+        let x = Tensor::randn(0.0f32, 1.0f32, (2, 3, MODEL_DIM), &device)?;
+        let out = sae.forward(&x)?;
+        let min_feature = out.features().min_all()?.to_scalar::<f32>()?;
+        assert!(
+            min_feature >= 0.0,
+            "features must be ReLU-positive, got min {min_feature}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_zero_params_produces_zero_outputs() -> Result<(), Error> {
+        let device = cpu();
+        let sae = zero_sae(&device)?;
+        let x = Tensor::from_vec(
+            vec![1.0f32, -2.0, 3.0, -4.0, 5.0, 6.0, 7.0, 8.0],
+            (2, MODEL_DIM),
+            &device,
+        )?;
+        let out = sae.forward(&x)?;
+        let feat_max = out.features().abs()?.max_all()?.to_scalar::<f32>()?;
+        let recon_max = out.reconstruction().abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(feat_max.abs() < 1e-6);
+        assert!(recon_max.abs() < 1e-6);
+        Ok(())
+    }
+
+    // -- loss decomposition ------------------------------------------------
+
+    #[test]
+    fn loss_total_equals_mse_plus_l1() -> Result<(), Error> {
+        let device = cpu();
+        let sae = fresh_sae(&device)?;
+        let x = Tensor::randn(0.0f32, 1.0f32, (2, MODEL_DIM), &device)?;
+        let loss = sae.loss(&x, L1Coefficient::new(0.01)?)?;
+        let total = loss.total().to_scalar::<f32>()?;
+        let mse = loss.mse().to_scalar::<f32>()?;
+        let l1 = loss.l1().to_scalar::<f32>()?;
+        assert!((total - (mse + l1)).abs() < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn loss_mse_matches_mean_sq_for_zero_sae() -> Result<(), Error> {
+        let device = cpu();
+        let sae = zero_sae(&device)?;
+        // x = [1, 2, 3, 4] -> mean(x^2) = (1 + 4 + 9 + 16) / 4 = 7.5
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, MODEL_DIM), &device)?;
+        let loss = sae.loss(&x, L1Coefficient::new(0.01)?)?;
+        let mse = loss.mse().to_scalar::<f32>()?;
+        assert!((mse - 7.5).abs() < 1e-4);
+        Ok(())
+    }
+
+    #[test]
+    fn loss_l1_zero_when_features_zero() -> Result<(), Error> {
+        let device = cpu();
+        let sae = zero_sae(&device)?;
+        let x = Tensor::randn(0.0f32, 1.0f32, (2, MODEL_DIM), &device)?;
+        let loss = sae.loss(&x, L1Coefficient::new(1.0)?)?;
+        let l1 = loss.l1().to_scalar::<f32>()?;
+        assert!(l1.abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn loss_l1_scales_linearly_with_coefficient() -> Result<(), Error> {
+        let device = cpu();
+        let sae = unit_bias_sae(&device)?;
+        // Features == 1 everywhere, so sum over sae_dim per token = SAE_DIM,
+        // mean over tokens = SAE_DIM, scaled L1 = SAE_DIM * coefficient.
+        let x = Tensor::zeros((2, MODEL_DIM), DType::F32, &device)?;
+        let low = sae.loss(&x, L1Coefficient::new(0.01)?)?;
+        let high = sae.loss(&x, L1Coefficient::new(0.02)?)?;
+        let low_l1 = low.l1().to_scalar::<f32>()?;
+        let high_l1 = high.l1().to_scalar::<f32>()?;
+        let expected_low = (SAE_DIM as f32) * 0.01;
+        let expected_high = (SAE_DIM as f32) * 0.02;
+        assert!((low_l1 - expected_low).abs() < 1e-5);
+        assert!((high_l1 - expected_high).abs() < 1e-5);
+        assert!(2.0f32.mul_add(-low_l1, high_l1).abs() < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn loss_components_nonnegative() -> Result<(), Error> {
+        let device = cpu();
+        let sae = fresh_sae(&device)?;
+        let x = Tensor::randn(0.0f32, 1.0f32, (2, MODEL_DIM), &device)?;
+        let loss = sae.loss(&x, L1Coefficient::new(0.01)?)?;
+        let mse = loss.mse().to_scalar::<f32>()?;
+        let l1 = loss.l1().to_scalar::<f32>()?;
+        assert!(mse >= 0.0);
+        assert!(l1 >= 0.0);
+        Ok(())
+    }
+}
