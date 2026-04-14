@@ -32,20 +32,7 @@ use plotters::prelude::{
 
 use gpt2_small_sae::cli::Args;
 use gpt2_small_sae::error::Error;
-use gpt2_small_sae::io_boundary;
-
-/// Local DTO for deserializing checkpoint metadata.  Fields are private
-/// and exposed via accessor methods; this decouples the plotter from the
-/// exact wire layout of [`io_boundary::CheckpointMeta`].
-#[derive(serde::Deserialize)]
-struct MetaRecord {
-    layer: usize,
-    sae_dim: usize,
-    model_dim: usize,
-    l1_coefficient: f64,
-    final_mse: f64,
-    final_l0: f64,
-}
+use gpt2_small_sae::io_boundary::{self, CheckpointMeta};
 
 /// A single point on the Pareto scatter plot.
 struct PointRecord {
@@ -111,16 +98,18 @@ fn load_point(raw: &str) -> Result<PointRecord, Error> {
     let content = std::fs::read_to_string(&meta_file).map_err(|e| Error::Boundary {
         reason: format!("failed to read metadata {}: {e}", meta_file.display()),
     })?;
-    let record: MetaRecord = serde_json::from_str(&content)?;
-    let expansion = record.sae_dim.checked_div(record.model_dim).unwrap_or(0);
+    let meta: CheckpointMeta = serde_json::from_str(&content)?;
+    let expansion = meta.sae_dim().checked_div(meta.model_dim()).unwrap_or(0);
     let label = format!(
         "L{}/{}x/l1={:.1e}",
-        record.layer, expansion, record.l1_coefficient
+        meta.layer(),
+        expansion,
+        meta.l1_coefficient()
     );
     Ok(PointRecord {
         label,
-        mse: record.final_mse,
-        l0: record.final_l0,
+        mse: meta.final_mse(),
+        l0: meta.final_l0(),
     })
 }
 
