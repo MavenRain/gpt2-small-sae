@@ -62,6 +62,10 @@ path = "src/bin/feature_corr.rs"
 name = "feature_hist"
 path = "src/bin/feature_hist.rs"
 
+[[bin]]
+name = "feature_coact"
+path = "src/bin/feature_coact.rs"
+
 [dependencies]
 comp-cat-rs = "0.5"
 

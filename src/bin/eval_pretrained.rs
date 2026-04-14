@@ -23,45 +23,18 @@ use comp_cat_rs::effect::io::Io;
 
 use gpt2_small_sae::activations::activation_stream;
 use gpt2_small_sae::cli::Args;
-use gpt2_small_sae::config::{BatchSize, ContextLength, LayerIndex, ModelDim, SaeDim};
-use gpt2_small_sae::dataset::tokenize_corpus;
+use gpt2_small_sae::config::{LayerIndex, ModelDim, SaeDim};
 use gpt2_small_sae::error::Error;
+use gpt2_small_sae::eval_opts::{SharedEvalOpts, build_batches};
 use gpt2_small_sae::gpt2::Gpt2;
 use gpt2_small_sae::io_boundary;
 use gpt2_small_sae::metrics::{DeadFraction, L0, Mse, VarianceExplained};
 use gpt2_small_sae::sae::Sae;
 
 const GPT2_DEPTH: usize = 12;
-const VOCAB_UPPER: f32 = 50256.0;
 
-/// CLI-configurable evaluation options.
-#[derive(Clone)]
-struct EvalOpts {
-    layer: usize,
-    expansion: usize,
-    batch_size: usize,
-    ctx_len: usize,
-    num_batches: usize,
-    corpus: Option<std::path::PathBuf>,
-    checkpoint: String,
-    output: Option<String>,
-}
-
-fn parse_eval_opts() -> Result<EvalOpts, Error> {
-    let args = Args::parse();
-    Ok(EvalOpts {
-        layer: args.get_or("layer", 8_usize)?,
-        expansion: args.get_or("expansion", 8_usize)?,
-        batch_size: args.get_or("batch-size", 4_usize)?,
-        ctx_len: args.get_or("ctx-len", 128_usize)?,
-        num_batches: args.get_or("batches", 8_usize)?,
-        corpus: args.get("corpus").map(std::path::PathBuf::from),
-        checkpoint: args
-            .get("checkpoint")
-            .or_else(|| args.positional(0))
-            .map_or_else(|| "sae_checkpoint.safetensors".to_string(), String::from),
-        output: args.get("output").map(String::from),
-    })
+fn parse_eval_opts() -> Result<SharedEvalOpts, Error> {
+    SharedEvalOpts::parse(&Args::parse())
 }
 
 /// Running accumulators for evaluation metrics.
@@ -73,12 +46,11 @@ struct EvalAccum {
     count: u64,
 }
 
-#[allow(clippy::too_many_lines)]
 fn eval_program() -> Io<Error, ()> {
     parse_eval_opts().map_or_else(
         |e| Io::suspend(move || Err(e)),
         |opts| {
-            let needs_tokenizer = opts.corpus.is_some();
+            let needs_tokenizer = opts.needs_tokenizer();
             io_boundary::acquire_device().flat_map(move |device| {
                 let opts = opts.clone();
                 io_boundary::download_gpt2_weights().flat_map(move |weights| {
@@ -92,81 +64,26 @@ fn eval_program() -> Io<Error, ()> {
                     tokenizer_io.flat_map(move |maybe_tokenizer| {
                         let opts2 = opts.clone();
                         Io::suspend(move || {
-                            let layer_index = LayerIndex::new(opts.layer, GPT2_DEPTH)?;
+                            let layer_index = LayerIndex::new(opts.layer(), GPT2_DEPTH)?;
                             let model_dim = ModelDim::GPT2_SMALL;
-                            let sae_dim = SaeDim::from_expansion(model_dim, opts.expansion)?;
+                            let sae_dim = SaeDim::from_expansion(model_dim, opts.expansion())?;
 
                             eprintln!("=== SAE evaluation ===");
-                            eprintln!("checkpoint: {}", opts.checkpoint);
-                            eprintln!("layer: {}, expansion: {}x", opts.layer, opts.expansion);
+                            eprintln!("checkpoint: {}", opts.checkpoint());
+                            eprintln!("layer: {}, expansion: {}x", opts.layer(), opts.expansion());
 
-                            let batches = opts.corpus.as_deref().map_or_else(
-                                || {
-                                    eprintln!(
-                                        "eval batches: {} x {} x {} (random tokens)",
-                                        opts.num_batches, opts.batch_size, opts.ctx_len
-                                    );
-                                    (0..opts.num_batches)
-                                        .map(|_| {
-                                            Tensor::rand(
-                                                0.0f32,
-                                                VOCAB_UPPER,
-                                                (opts.batch_size, opts.ctx_len),
-                                                &device,
-                                            )
-                                            .and_then(|t| t.to_dtype(DType::U32))
-                                            .map_err(Error::from)
-                                        })
-                                        .collect::<Result<Vec<_>, _>>()
-                                },
-                                |path| {
-                                    eprintln!("corpus: {}", path.display());
-                                    let tokenizer = maybe_tokenizer.as_ref().ok_or_else(|| {
-                                        Error::Boundary {
-                                            reason: "tokenizer not loaded".into(),
-                                        }
-                                    })?;
-                                    let text = std::fs::read_to_string(path).map_err(|e| {
-                                        Error::Boundary {
-                                            reason: format!(
-                                                "failed to read corpus {}: {e}",
-                                                path.display()
-                                            ),
-                                        }
-                                    })?;
-                                    let bs = BatchSize::new(opts.batch_size)?;
-                                    let cl = ContextLength::new(opts.ctx_len)?;
-                                    let batches =
-                                        tokenize_corpus(&text, tokenizer, bs, cl, &device)?;
-                                    if batches.is_empty() {
-                                        Err(Error::Boundary {
-                                            reason: format!(
-                                                "corpus too short ({} tokens needed)",
-                                                opts.batch_size * opts.ctx_len
-                                            ),
-                                        })
-                                    } else {
-                                        eprintln!(
-                                            "eval batches: {} x {} x {}",
-                                            batches.len(),
-                                            opts.batch_size,
-                                            opts.ctx_len,
-                                        );
-                                        Ok(batches)
-                                    }
-                                },
-                            )?;
+                            let batches = build_batches(&opts, maybe_tokenizer.as_ref(), &device)?;
                             eprintln!();
 
-                            eprintln!("loading SAE from {}...", opts.checkpoint);
+                            eprintln!("loading SAE from {}...", opts.checkpoint());
                             let sae = Sae::from_safetensors(
-                                std::path::Path::new(&opts.checkpoint),
+                                std::path::Path::new(opts.checkpoint()),
                                 model_dim,
                                 sae_dim,
                                 &device,
                             )?;
 
-                            eprintln!("loading GPT-2 small (layers 0..{})...", opts.layer);
+                            eprintln!("loading GPT-2 small (layers 0..{})...", opts.layer());
                             let gpt2 = Gpt2::from_bytes(weights, layer_index, &device)?;
 
                             let feature_counts =
@@ -205,7 +122,7 @@ fn evaluate(
     activations: &[Tensor],
     initial_counts: Tensor,
     sae_dim: SaeDim,
-    opts: &EvalOpts,
+    opts: &SharedEvalOpts,
 ) -> Result<(), Error> {
     let accum = activations.iter().try_fold(
         EvalAccum {
@@ -256,12 +173,11 @@ fn evaluate(
         sae_dim.as_usize() / sae.model_dim().as_usize()
     );
 
-    // Optionally write results as JSON.
-    opts.output.as_ref().map_or(Ok(()), |path| {
+    opts.output().map_or(Ok(()), |path| {
         let record = serde_json::json!({
-            "checkpoint": opts.checkpoint,
-            "layer": opts.layer,
-            "expansion": opts.expansion,
+            "checkpoint": opts.checkpoint(),
+            "layer": opts.layer(),
+            "expansion": opts.expansion(),
             "eval_batches": accum.count,
             "mse": mse_avg,
             "l0": l0_avg,

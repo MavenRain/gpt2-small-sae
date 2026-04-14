@@ -33,6 +33,9 @@
 //!   over.
 //! - [`io_boundary`] contains the effectful primitives (hub download,
 //!   safetensors load, device acquisition) wrapped in `Io`.
+//! - [`eval_opts`] defines [`eval_opts::SharedEvalOpts`] and
+//!   [`eval_opts::build_batches`], the flag set and batch-construction
+//!   helper shared by every evaluation binary.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -42,6 +45,7 @@ pub mod cli;
 pub mod config;
 pub mod dataset;
 pub mod error;
+pub mod eval_opts;
 pub mod gpt2;
 pub mod io_boundary;
 pub mod metrics;
