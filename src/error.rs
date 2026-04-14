@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn from_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "oops");
+        let io_err = std::io::Error::other("oops");
         let e: Error = io_err.into();
         assert!(matches!(e, Error::Io(_)));
     }
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn source_returns_some_for_io_variant() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "inner");
+        let io_err = std::io::Error::other("inner");
         let e = Error::Io(io_err);
         assert!(std::error::Error::source(&e).is_some());
     }

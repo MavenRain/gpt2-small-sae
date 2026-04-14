@@ -48,3 +48,71 @@ pub fn activation_stream(gpt2: Gpt2, batches: Vec<Tensor>) -> Stream<Error, Tens
         }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LayerIndex;
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+
+    const D_MODEL: usize = 768;
+
+    fn fresh_gpt2() -> Result<Gpt2, Error> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        Gpt2::new(vb, LayerIndex::new(0, 12)?)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn id_batch(batch: usize, seq: usize) -> Result<Tensor, Error> {
+        let data: Vec<u32> = (0..(batch * seq) as u32).collect();
+        Tensor::from_vec(data, (batch, seq), &Device::Cpu).map_err(Error::from)
+    }
+
+    #[test]
+    fn empty_batches_yield_nothing() -> Result<(), Error> {
+        let gpt2 = fresh_gpt2()?;
+        let stream = activation_stream(gpt2, Vec::new());
+        let collected = stream.collect().run()?;
+        assert!(collected.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn single_batch_flattens_to_2d() -> Result<(), Error> {
+        let gpt2 = fresh_gpt2()?;
+        let batch = id_batch(2, 3)?;
+        let stream = activation_stream(gpt2, vec![batch]);
+        let collected = stream.collect().run()?;
+        assert_eq!(collected.len(), 1);
+        let elem = collected.first().ok_or_else(|| Error::Boundary {
+            reason: "missing first element".into(),
+        })?;
+        assert_eq!(elem.dims(), &[2 * 3, D_MODEL]);
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_batches_all_yielded() -> Result<(), Error> {
+        let gpt2 = fresh_gpt2()?;
+        let batches = vec![id_batch(1, 4)?, id_batch(1, 4)?, id_batch(1, 4)?];
+        let stream = activation_stream(gpt2, batches);
+        let collected = stream.collect().run()?;
+        assert_eq!(collected.len(), 3);
+        collected.iter().try_for_each(|t| {
+            assert_eq!(t.dims(), &[4, D_MODEL]);
+            Ok::<_, Error>(())
+        })
+    }
+
+    #[test]
+    fn rejects_1d_batch() -> Result<(), Error> {
+        let gpt2 = fresh_gpt2()?;
+        let bad = Tensor::from_vec(vec![0u32, 1, 2, 3], 4, &Device::Cpu)?;
+        let stream = activation_stream(gpt2, vec![bad]);
+        assert!(stream.collect().run().is_err());
+        Ok(())
+    }
+}

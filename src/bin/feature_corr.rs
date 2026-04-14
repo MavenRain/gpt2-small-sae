@@ -18,6 +18,10 @@
 //! or duplication and suggest the L1 coefficient should be raised (or
 //! the dictionary width lowered).
 //!
+//! Passing `--heatmap path.png` also renders a diverging red-white-blue
+//! heatmap of the (optionally downsampled) correlation matrix for a
+//! quick visual read of off-diagonal structure.
+//!
 //! # Usage
 //!
 //! ```text
@@ -28,12 +32,20 @@
 //! cargo run --release --bin feature_corr -- \
 //!   --checkpoint sae_l4_16x.safetensors --layer 4 --expansion 16 \
 //!   --top-k 30 --output corr.json
+//!
+//! # Render a heatmap PNG too:
+//! cargo run --release --bin feature_corr -- \
+//!   --checkpoint sae_l4_16x.safetensors --expansion 16 \
+//!   --heatmap corr_l4_16x.png --heatmap-size 256
 //! ```
 
 use std::collections::BinaryHeap;
 
 use candle_core::{D, DType, Device, Tensor};
 use comp_cat_rs::effect::io::Io;
+use plotters::prelude::{
+    BitMapBackend, ChartBuilder, IntoDrawingArea, RGBColor, Rectangle, ShapeStyle, WHITE,
+};
 
 use gpt2_small_sae::cli::Args;
 use gpt2_small_sae::config::{ModelDim, SaeDim};
@@ -54,6 +66,10 @@ struct CorrOpts {
     checkpoint: String,
     top_k: usize,
     output: Option<String>,
+    heatmap: Option<String>,
+    heatmap_size: usize,
+    heatmap_width: u32,
+    heatmap_height: u32,
 }
 
 fn parse_corr_opts() -> Result<CorrOpts, Error> {
@@ -67,6 +83,10 @@ fn parse_corr_opts() -> Result<CorrOpts, Error> {
             .map_or_else(|| "sae_checkpoint.safetensors".to_string(), String::from),
         top_k: args.get_or("top-k", 20_usize)?,
         output: args.get("output").map(String::from),
+        heatmap: args.get("heatmap").map(String::from),
+        heatmap_size: args.get_or("heatmap-size", 256_usize)?,
+        heatmap_width: args.get_or("heatmap-width", 900_u32)?,
+        heatmap_height: args.get_or("heatmap-height", 900_u32)?,
     })
 }
 
@@ -180,6 +200,116 @@ fn top_nearest_pairs(corr: &Tensor, k: usize, device: &Device) -> Result<Vec<Nea
 }
 
 // -----------------------------------------------------------------------
+// Heatmap rendering
+// -----------------------------------------------------------------------
+
+/// Average-pool the correlation matrix down to a roughly `target`-sided
+/// square.  When `n <= target` the matrix is returned unchanged;
+/// otherwise the pooling block size is `n / target` and the bottom-right
+/// `n mod target` rows/columns are trimmed to keep the pooling divisible.
+fn downsample(corr: &Tensor, target: usize) -> Result<(Tensor, usize), Error> {
+    let n = square_side(corr, "correlation matrix")?;
+    if n <= target {
+        Ok((corr.clone(), n))
+    } else {
+        let block = n / target;
+        let trimmed_side = target * block;
+        let trimmed = corr
+            .narrow(0, 0, trimmed_side)?
+            .narrow(1, 0, trimmed_side)?;
+        let pooled = trimmed
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .avg_pool2d(block)?
+            .squeeze(0)?
+            .squeeze(0)?;
+        Ok((pooled, target))
+    }
+}
+
+/// Diverging red-white-blue colormap.  `v` is clamped into `[-1, 1]`;
+/// positive values interpolate from white to the project's canonical
+/// red `(228, 26, 28)` and negative values from white to blue
+/// `(55, 126, 184)`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names
+)]
+fn value_to_color(value: f32) -> RGBColor {
+    let clamped = value.clamp(-1.0, 1.0);
+    if clamped >= 0.0 {
+        let t = clamped;
+        let red = (255.0 - t * 27.0) as u8;
+        let green = (255.0 - t * 229.0) as u8;
+        let blue = (255.0 - t * 227.0) as u8;
+        RGBColor(red, green, blue)
+    } else {
+        let t = -clamped;
+        let red = (255.0 - t * 200.0) as u8;
+        let green = (255.0 - t * 129.0) as u8;
+        let blue = (255.0 - t * 71.0) as u8;
+        RGBColor(red, green, blue)
+    }
+}
+
+fn plot_err<E: std::fmt::Debug>(e: E) -> Error {
+    Error::Boundary {
+        reason: format!("plot error: {e:?}"),
+    }
+}
+
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn draw_heatmap(corr: &Tensor, opts: &CorrOpts, path: &str) -> Result<(), Error> {
+    let (downsampled, side) = downsample(corr, opts.heatmap_size)?;
+    let data: Vec<f32> = downsampled.flatten_all()?.to_vec1::<f32>()?;
+    let side_i = side as i32;
+
+    let root =
+        BitMapBackend::new(path, (opts.heatmap_width, opts.heatmap_height)).into_drawing_area();
+    root.fill(&WHITE).map_err(plot_err)?;
+
+    ChartBuilder::on(&root)
+        .caption(
+            format!("Feature correlation heatmap ({side}x{side})"),
+            ("sans-serif", 20),
+        )
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0_i32..side_i, side_i..0_i32)
+        .map_err(plot_err)
+        .and_then(|mut chart| {
+            chart
+                .configure_mesh()
+                .disable_mesh()
+                .x_desc("feature j")
+                .y_desc("feature i")
+                .draw()
+                .map_err(plot_err)?;
+            let data_ref = &data;
+            let rects: Vec<_> = (0..side)
+                .flat_map(|y| {
+                    (0..side).filter_map(move |x| {
+                        data_ref.get(y * side + x).map(|&v| {
+                            Rectangle::new(
+                                [(x as i32, y as i32), ((x + 1) as i32, (y + 1) as i32)],
+                                ShapeStyle::from(value_to_color(v)).filled(),
+                            )
+                        })
+                    })
+                })
+                .collect();
+            chart.draw_series(rects).map_err(plot_err)?;
+            Ok::<_, Error>(())
+        })?;
+
+    root.present().map_err(plot_err)?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
 // Reporting
 // -----------------------------------------------------------------------
 
@@ -256,7 +386,13 @@ fn feature_corr_program() -> Io<Error, ()> {
                     let corr = cosine_similarity(sae.w_dec())?;
                     let stats = compute_stats(&corr, &device)?;
                     let top = top_nearest_pairs(&corr, opts.top_k, &device)?;
-                    report(&stats, &top, sae_dim.as_usize(), &opts)
+                    report(&stats, &top, sae_dim.as_usize(), &opts)?;
+                    opts.heatmap.as_ref().map_or(Ok(()), |path| {
+                        eprintln!("\nrendering heatmap to {path}...");
+                        draw_heatmap(&corr, &opts, path)?;
+                        eprintln!("heatmap written to {path}");
+                        Ok(())
+                    })
                 })
             })
         },

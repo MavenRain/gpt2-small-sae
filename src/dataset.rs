@@ -46,3 +46,114 @@ pub fn tokenize_corpus(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    /// Build a minimal Tokenizer that whitespace-splits input and looks up
+    /// single-char words in an 8-token vocab.  Unknown chars map to `[UNK]`.
+    fn toy_tokenizer() -> Result<tokenizers::Tokenizer, Error> {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "a": 0, "b": 1, "c": 2, "d": 3,
+                    "e": 4, "f": 5, "g": 6, "h": 7,
+                    "[UNK]": 8
+                },
+                "unk_token": "[UNK]"
+            }
+        }"#;
+        tokenizers::Tokenizer::from_str(json).map_err(|e| Error::Tokenizer(TokenizerError::new(e)))
+    }
+
+    /// Build a whitespace-delimited string of `n` repeated tokens.
+    fn make_text(n: usize) -> String {
+        (0..n)
+            .map(|i| {
+                let ch = (b'a' + u8::try_from(i % 8).unwrap_or(0)) as char;
+                ch.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn tokenize_chunks_exact_batch() -> Result<(), Error> {
+        let tokenizer = toy_tokenizer()?;
+        let text = make_text(8);
+        let batches = tokenize_corpus(
+            &text,
+            &tokenizer,
+            BatchSize::new(2)?,
+            ContextLength::new(4)?,
+            &Device::Cpu,
+        )?;
+        assert_eq!(batches.len(), 1);
+        let b = batches.first().ok_or_else(|| Error::Boundary {
+            reason: "missing".into(),
+        })?;
+        assert_eq!(b.dims(), &[2, 4]);
+        assert_eq!(b.dtype(), DType::U32);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_multiple_batches() -> Result<(), Error> {
+        let tokenizer = toy_tokenizer()?;
+        let text = make_text(24);
+        let batches = tokenize_corpus(
+            &text,
+            &tokenizer,
+            BatchSize::new(2)?,
+            ContextLength::new(4)?,
+            &Device::Cpu,
+        )?;
+        assert_eq!(batches.len(), 3);
+        batches.iter().try_for_each(|b| {
+            assert_eq!(b.dims(), &[2, 4]);
+            Ok::<_, Error>(())
+        })
+    }
+
+    #[test]
+    fn tokenize_drops_trailing_incomplete_batch() -> Result<(), Error> {
+        let tokenizer = toy_tokenizer()?;
+        // 10 tokens, but tokens_per_batch = 2 * 4 = 8; only one batch fits.
+        let text = make_text(10);
+        let batches = tokenize_corpus(
+            &text,
+            &tokenizer,
+            BatchSize::new(2)?,
+            ContextLength::new(4)?,
+            &Device::Cpu,
+        )?;
+        assert_eq!(batches.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_empty_when_corpus_too_short() -> Result<(), Error> {
+        let tokenizer = toy_tokenizer()?;
+        let text = make_text(3);
+        let batches = tokenize_corpus(
+            &text,
+            &tokenizer,
+            BatchSize::new(2)?,
+            ContextLength::new(4)?,
+            &Device::Cpu,
+        )?;
+        assert!(batches.is_empty());
+        Ok(())
+    }
+}

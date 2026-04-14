@@ -387,3 +387,96 @@ impl Mlp {
             .map_err(Error::from)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::VarMap;
+
+    fn cpu() -> Device {
+        Device::Cpu
+    }
+
+    fn fresh_gpt2(layer_index: usize) -> Result<(Gpt2, VarMap), Error> {
+        let device = cpu();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let li = LayerIndex::new(layer_index, GPT2_DEPTH)?;
+        Gpt2::new(vb, li).map(|g| (g, varmap))
+    }
+
+    fn fresh_gpt2_full() -> Result<(Gpt2Full, VarMap), Error> {
+        let device = cpu();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        Gpt2Full::new(vb).map(|g| (g, varmap))
+    }
+
+    // -- Gpt2::residual_stream ----------------------------------------------
+
+    #[test]
+    fn residual_stream_shape_no_blocks() -> Result<(), Error> {
+        let (gpt2, _vm) = fresh_gpt2(0)?;
+        let ids = Tensor::from_vec(vec![0u32, 1, 2, 3], (2, 2), &cpu())?;
+        let resid = gpt2.residual_stream(&ids)?;
+        assert_eq!(resid.dims(), &[2, 2, D_MODEL]);
+        Ok(())
+    }
+
+    #[test]
+    fn residual_stream_shape_one_block() -> Result<(), Error> {
+        let (gpt2, _vm) = fresh_gpt2(1)?;
+        let ids = Tensor::from_vec(vec![0u32, 1, 2, 3], (2, 2), &cpu())?;
+        let resid = gpt2.residual_stream(&ids)?;
+        assert_eq!(resid.dims(), &[2, 2, D_MODEL]);
+        Ok(())
+    }
+
+    #[test]
+    fn residual_stream_rejects_1d_input() -> Result<(), Error> {
+        let (gpt2, _vm) = fresh_gpt2(0)?;
+        let ids = Tensor::from_vec(vec![0u32, 1, 2], 3, &cpu())?;
+        assert!(matches!(
+            gpt2.residual_stream(&ids),
+            Err(Error::Shape { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn residual_stream_rejects_3d_input() -> Result<(), Error> {
+        let (gpt2, _vm) = fresh_gpt2(0)?;
+        let ids = Tensor::from_vec(vec![0u32; 8], (2, 2, 2), &cpu())?;
+        assert!(matches!(
+            gpt2.residual_stream(&ids),
+            Err(Error::Shape { .. })
+        ));
+        Ok(())
+    }
+
+    // -- Gpt2::from_bytes ---------------------------------------------------
+
+    #[test]
+    fn from_bytes_invalid_data_errors() -> Result<(), Error> {
+        let bytes = vec![0u8; 16];
+        let li = LayerIndex::new(0, GPT2_DEPTH)?;
+        assert!(Gpt2::from_bytes(bytes, li, &cpu()).is_err());
+        Ok(())
+    }
+
+    // -- Gpt2Full shape errors ----------------------------------------------
+
+    #[test]
+    fn full_logits_rejects_1d_input() -> Result<(), Error> {
+        let (gpt2, _vm) = fresh_gpt2_full()?;
+        let ids = Tensor::from_vec(vec![0u32, 1, 2], 3, &cpu())?;
+        assert!(matches!(gpt2.logits(&ids), Err(Error::Shape { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn full_from_bytes_invalid_data_errors() {
+        let bytes = vec![0u8; 16];
+        assert!(Gpt2Full::from_bytes(bytes, &cpu()).is_err());
+    }
+}

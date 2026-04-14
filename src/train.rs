@@ -854,7 +854,7 @@ mod tests {
         let floor = LearningRate::new(1e-4)?;
         let sched = LrSchedule::new(peak, floor, 0, 1000)?;
         // Midpoint of cosine: cos(pi * 0.5) = 0, so lr = 0.5*(peak-floor) + floor
-        let expected = 0.5 * (1e-3 - 1e-4) + 1e-4;
+        let expected = 0.5f64.mul_add(1e-3 - 1e-4, 1e-4);
         assert!((sched.at_step(500) - expected).abs() < 1e-10);
         Ok(())
     }
